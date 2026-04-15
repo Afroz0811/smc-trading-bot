@@ -94,7 +94,6 @@ def update_trades(price):
 
 # ===== STREAM =====
 async def stream(pair):
-
     url = f"https://api.exchange.coinbase.com/products/{pair}/candles?granularity=60"
 
     while True:
@@ -102,7 +101,7 @@ async def stream(pair):
             res = requests.get(url, timeout=5)
 
             if res.status_code != 200:
-                await asyncio.sleep(10)
+                await asyncio.sleep(30)
                 continue
 
             data = res.json()
@@ -111,7 +110,7 @@ async def stream(pair):
             closes.reverse()
 
             if len(closes) < 50:
-                await asyncio.sleep(10)
+                await asyncio.sleep(30)
                 continue
 
             price = closes[-1]
@@ -123,8 +122,8 @@ async def stream(pair):
             if sig:
                 now = time.time()
 
-                if pair in last_signal_time and now - last_signal_time[pair] < COOLDOWN:
-                    await asyncio.sleep(5)
+                if pair in last_signal_time and now - last_signal_time[pair] < 300:
+                    await asyncio.sleep(10)
                     continue
 
                 last_signal_time[pair] = now
@@ -146,7 +145,8 @@ async def stream(pair):
         except Exception as e:
             print("ERROR:", e)
 
-        await asyncio.sleep(15)
+        # 🔥 KEY FIX → LONGER SLEEP
+        await asyncio.sleep(30)
 
 
 async def run_forever(pair):
