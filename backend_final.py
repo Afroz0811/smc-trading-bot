@@ -3,12 +3,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-# ===== CONFIG =====
+# ===== GLOBAL DATA =====
 pairs = ["BTC-USDT"]
-
 signals = []
 trades = []
-
 COOLDOWN = 300
 last_signal_time = {}
 
@@ -19,93 +17,60 @@ CHAT_ID = os.getenv("CHAT_ID")
 def send_telegram(msg):
     if not BOT_TOKEN or not CHAT_ID:
         return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg},
+            timeout=5
+        )
+    except:
+        pass
 
 
 def send_signal(sig):
-    msg = f"""
-🚀 SMC SIGNAL
-
-📊 {sig['pair']} {sig['signal']}
-
-💰 Entry: {round(sig['entry'],2)}
-🛑 SL: {round(sig['sl'],2)}
-🎯 TP: {round(sig['tp'],2)}
-
-⚖️ RR ~ 1:3
-"""
+    msg = f"🚀 {sig['pair']} {sig['signal']}\nEntry: {round(sig['entry'],2)}"
     send_telegram(msg)
 
 
 def send_close(t):
-    msg = f"""
-📊 TRADE CLOSED
-
-{t['pair']} {t['signal']}
-Result: {t['status']}
-"""
+    msg = f"📊 CLOSED {t['pair']} {t['status']}"
     send_telegram(msg)
 
 
 # ===== STRATEGY =====
 def generate_signal(closes, pair):
 
-    if len(closes) < 100:
+    if len(closes) < 50:
         return None
 
     price = closes[-1]
 
     ema20 = sum(closes[-20:]) / 20
     ema50 = sum(closes[-50:]) / 50
-    ema200 = sum(closes[-100:]) / 100
 
-  trend = "UP" if ema20 > ema50 else "DOWN" if ema20 < ema50 < ema200 else "RANGE"
+    trend = "UP" if ema20 > ema50 else "DOWN"
 
-    high = max(closes[-30:-1])
-    low = min(closes[-30:-1])
+    high = max(closes[-20:-1])
+    low = min(closes[-20:-1])
 
-    sweep = None
-    if price > high:
-        sweep = "SELL"
-    elif price < low:
-        sweep = "BUY"
-
-    if not sweep:
-        return None
-
-    if sweep == "BUY" and trend != "UP":
-        return None
-    if sweep == "SELL" and trend != "DOWN":
-        return None
-
-    move = abs(price - closes[-2]) / closes[-2] * 100
-    if move < 0.05:
-        return None
-
-    entry = price
-
-    if sweep == "BUY":
-        sl = price * 0.994
-        tp = price * 1.03
+    if price > high and trend == "DOWN":
+        signal = "SELL"
+    elif price < low and trend == "UP":
+        signal = "BUY"
     else:
-        sl = price * 1.006
-        tp = price * 0.97
+        return None
 
     return {
         "pair": pair,
-        "price": round(price, 2),
-        "signal": sweep,
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "time": time.time()
+        "signal": signal,
+        "entry": price,
+        "sl": price * 0.995 if signal == "BUY" else price * 1.005,
+        "tp": price * 1.01 if signal == "BUY" else price * 0.99
     }
 
 
 # ===== TRADE TRACKING =====
 def update_trades(price):
-
     for t in trades:
         if t["status"] != "OPEN":
             continue
@@ -127,23 +92,7 @@ def update_trades(price):
                 send_close(t)
 
 
-# ===== STATS =====
-def get_stats():
-    wins = len([t for t in trades if t["status"] == "WIN"])
-    losses = len([t for t in trades if t["status"] == "LOSS"])
-    total = len(trades)
-
-    wr = (wins / total * 100) if total else 0
-
-    return {
-        "total": total,
-        "wins": wins,
-        "losses": losses,
-        "winrate": round(wr, 2)
-    }
-
-
-# ===== DATA LOOP (COINBASE SAFE) =====
+# ===== STREAM =====
 async def stream(pair):
 
     url = f"https://api.exchange.coinbase.com/products/{pair}/candles?granularity=60"
@@ -153,23 +102,12 @@ async def stream(pair):
             res = requests.get(url, timeout=5)
 
             if res.status_code != 200:
-                print("API ERROR")
                 await asyncio.sleep(10)
                 continue
 
             data = res.json()
 
-            if not isinstance(data, list) or len(data) < 50:
-                print("BAD DATA")
-                await asyncio.sleep(10)
-                continue
-
-            closes = []
-
-            for c in data:
-                if len(c) > 4:
-                    closes.append(float(c[4]))
-
+            closes = [float(c[4]) for c in data if len(c) > 4]
             closes.reverse()
 
             if len(closes) < 50:
@@ -192,7 +130,7 @@ async def stream(pair):
                 last_signal_time[pair] = now
 
                 signals.append(sig)
-                signals[:] = signals[-30:]
+                signals[:] = signals[-20:]
 
                 trades.append({
                     "pair": sig["pair"],
@@ -202,7 +140,6 @@ async def stream(pair):
                     "tp": sig["tp"],
                     "status": "OPEN"
                 })
-                trades[:] = trades[-50:]
 
                 send_signal(sig)
 
@@ -212,25 +149,23 @@ async def stream(pair):
         await asyncio.sleep(15)
 
 
-# ===== KEEP LOOP ALIVE =====
 async def run_forever(pair):
     while True:
         try:
             await stream(pair)
         except Exception as e:
-            print("STREAM CRASH:", e)
+            print("RESTART:", e)
             await asyncio.sleep(5)
 
 
-# ===== LIFESPAN FIX (IMPORTANT) =====
+# ===== LIFESPAN =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 BOT STARTED (LIFESPAN)")
+    print("🚀 BOT STARTED")
 
     tasks = []
     for p in pairs:
-        task = asyncio.create_task(run_forever(p))
-        tasks.append(task)
+        tasks.append(asyncio.create_task(run_forever(p)))
 
     yield
 
@@ -250,10 +185,10 @@ app.add_middleware(
 )
 
 
-# ===== API =====
+# ===== ROUTES =====
 @app.get("/")
 def home():
-    return {"status": "SMC BOT LIVE 🚀"}
+    return {"status": "LIVE 🚀"}
 
 
 @app.get("/signals")
@@ -264,8 +199,3 @@ def get_signals():
 @app.get("/trades")
 def get_trades():
     return trades
-
-
-@app.get("/stats")
-def stats():
-    return get_stats()
