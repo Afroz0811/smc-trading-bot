@@ -60,7 +60,7 @@ def generate_signal(closes, pair):
     ema50 = sum(closes[-50:]) / 50
     ema200 = sum(closes[-100:]) / 100
 
-    trend = "UP" if ema20 > ema50 > ema200 else "DOWN" if ema20 < ema50 < ema200 else "RANGE"
+  trend = "UP" if ema20 > ema50 else "DOWN" if ema20 < ema50 < ema200 else "RANGE"
 
     high = max(closes[-30:-1])
     low = min(closes[-30:-1])
@@ -80,7 +80,7 @@ def generate_signal(closes, pair):
         return None
 
     move = abs(price - closes[-2]) / closes[-2] * 100
-    if move < 0.2:
+    if move < 0.05:
         return None
 
     entry = price
