@@ -1,25 +1,15 @@
 import asyncio, requests, time, os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from contextlib import asynccontextmanager
 
 # ===== CONFIG =====
-pairs = ["btcusdt"]  # keep 1 pair for free plan stability
+pairs = ["BTC-USDT"]
 
-market_data = {}
 signals = []
 trades = []
 
-COOLDOWN = 300  # 5 min cooldown
+COOLDOWN = 300
 last_signal_time = {}
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -58,7 +48,7 @@ Result: {t['status']}
     send_telegram(msg)
 
 
-# ===== SMC LOGIC (IMPROVED) =====
+# ===== STRATEGY =====
 def generate_signal(closes, pair):
 
     if len(closes) < 100:
@@ -66,14 +56,12 @@ def generate_signal(closes, pair):
 
     price = closes[-1]
 
-    # EMA trend
     ema20 = sum(closes[-20:]) / 20
     ema50 = sum(closes[-50:]) / 50
     ema200 = sum(closes[-100:]) / 100
 
     trend = "UP" if ema20 > ema50 > ema200 else "DOWN" if ema20 < ema50 < ema200 else "RANGE"
 
-    # Liquidity sweep
     high = max(closes[-30:-1])
     low = min(closes[-30:-1])
 
@@ -86,18 +74,15 @@ def generate_signal(closes, pair):
     if not sweep:
         return None
 
-    # Trend confirmation
     if sweep == "BUY" and trend != "UP":
         return None
     if sweep == "SELL" and trend != "DOWN":
         return None
 
-    # Volatility filter
     move = abs(price - closes[-2]) / closes[-2] * 100
     if move < 0.2:
         return None
 
-    # Entry + RR
     entry = price
 
     if sweep == "BUY":
@@ -108,7 +93,7 @@ def generate_signal(closes, pair):
         tp = price * 0.97
 
     return {
-        "pair": pair.upper(),
+        "pair": pair,
         "price": round(price, 2),
         "signal": sweep,
         "entry": entry,
@@ -118,7 +103,7 @@ def generate_signal(closes, pair):
     }
 
 
-# ===== TRADE MANAGEMENT =====
+# ===== TRADE TRACKING =====
 def update_trades(price):
 
     for t in trades:
@@ -158,10 +143,10 @@ def get_stats():
     }
 
 
-# ===== MAIN LOOP (REST API SAFE) =====
+# ===== DATA LOOP (COINBASE SAFE) =====
 async def stream(pair):
 
-    url = "https://api.exchange.coinbase.com/products/BTC-USDT/candles?granularity=60"
+    url = f"https://api.exchange.coinbase.com/products/{pair}/candles?granularity=60"
 
     while True:
         try:
@@ -226,6 +211,45 @@ async def stream(pair):
 
         await asyncio.sleep(15)
 
+
+# ===== KEEP LOOP ALIVE =====
+async def run_forever(pair):
+    while True:
+        try:
+            await stream(pair)
+        except Exception as e:
+            print("STREAM CRASH:", e)
+            await asyncio.sleep(5)
+
+
+# ===== LIFESPAN FIX (IMPORTANT) =====
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🚀 BOT STARTED (LIFESPAN)")
+
+    tasks = []
+    for p in pairs:
+        task = asyncio.create_task(run_forever(p))
+        tasks.append(task)
+
+    yield
+
+    for t in tasks:
+        t.cancel()
+
+
+# ===== APP =====
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 # ===== API =====
 @app.get("/")
 def home():
@@ -245,10 +269,3 @@ def get_trades():
 @app.get("/stats")
 def stats():
     return get_stats()
-
-
-# ===== START =====
-@app.on_event("startup")
-async def start():
-    for p in pairs:
-        asyncio.create_task(stream(p))
