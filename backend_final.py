@@ -1,4 +1,4 @@
-import asyncio, json, websockets, requests, time, os
+import asyncio, requests, time, os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -12,7 +12,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🔥 USE ONLY 1 PAIR (IMPORTANT FOR MEMORY)
+# 🔥 SINGLE PAIR (IMPORTANT)
 pairs = ["btcusdt"]
 
 market_data = {}
@@ -61,13 +61,11 @@ Result: {t['status']}
     requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
 
 
-# ===== SMC LOGIC (LIGHT VERSION) =====
-def generate_signal(candles, pair):
+# ===== LIGHT SMC LOGIC =====
+def generate_signal(closes, pair):
 
-    if len(candles) < 80:
+    if len(closes) < 80:
         return None
-
-    closes = candles
 
     price = closes[-1]
 
@@ -83,14 +81,12 @@ def generate_signal(candles, pair):
 
     if price > recent_high:
         sweep = "SELL"
-
-    if price < recent_low:
+    elif price < recent_low:
         sweep = "BUY"
 
     if not sweep:
         return None
 
-    # FILTER
     if sweep == "BUY" and trend != "UP":
         return None
 
@@ -121,7 +117,7 @@ def generate_signal(candles, pair):
     }
 
 
-# ===== TRADE TRACK =====
+# ===== TRADE TRACKING =====
 def update_trades(price):
     for t in trades:
         if t["status"] != "OPEN":
@@ -160,71 +156,65 @@ def get_stats():
     }
 
 
-# ===== STREAM (LOW MEMORY + RECONNECT) =====
+# ===== STREAM (REST API POLLING) =====
 async def stream(pair):
 
-    url = f"wss://stream.binance.com:9443/ws/{pair}@kline_1m"
+    url = f"https://api.binance.com/api/v3/klines?symbol={pair.upper()}&interval=1m&limit=100"
 
     while True:
         try:
-            async with websockets.connect(url) as ws:
-                print(f"Connected: {pair}")
+            res = requests.get(url).json()
 
-                market_data[pair] = []
+            closes = [float(x[4]) for x in res]
 
-                while True:
-                    data = json.loads(await ws.recv())
-                    price = float(data["k"]["c"])
+            market_data[pair] = closes
 
-                    market_data[pair].append(price)
+            price = closes[-1]
 
-                    # 🔥 LIMIT DATA
-                    if len(market_data[pair]) > 100:
-                        market_data[pair] = market_data[pair][-100:]
+            update_trades(price)
 
-                    update_trades(price)
+            sig = generate_signal(closes, pair)
 
-                    sig = generate_signal(market_data[pair], pair)
+            if sig:
+                now = time.time()
 
-                    if sig:
-                        now = time.time()
+                # COOLDOWN
+                if pair in last_signal_time and now - last_signal_time[pair] < COOLDOWN:
+                    await asyncio.sleep(5)
+                    continue
 
-                        # COOLDOWN
-                        if pair in last_signal_time and now - last_signal_time[pair] < COOLDOWN:
-                            continue
+                # DUPLICATE FILTER
+                if signals:
+                    last = signals[-1]
+                    if abs(sig["entry"] - last["entry"]) / last["entry"] < 0.003:
+                        await asyncio.sleep(5)
+                        continue
 
-                        # DUPLICATE FILTER
-                        if signals:
-                            last = signals[-1]
-                            if abs(sig["entry"] - last["entry"]) / last["entry"] < 0.003:
-                                continue
+                last_signal_time[pair] = now
 
-                        last_signal_time[pair] = now
+                signals.append(sig)
 
-                        signals.append(sig)
+                if len(signals) > 30:
+                    signals[:] = signals[-30:]
 
-                        # 🔥 LIMIT SIGNALS
-                        if len(signals) > 30:
-                            signals[:] = signals[-30:]
+                trades.append({
+                    "pair": sig["pair"],
+                    "signal": sig["signal"],
+                    "entry": sig["entry"],
+                    "sl": sig["sl"],
+                    "tp": sig["tp"],
+                    "status": "OPEN"
+                })
 
-                        trades.append({
-                            "pair": sig["pair"],
-                            "signal": sig["signal"],
-                            "entry": sig["entry"],
-                            "sl": sig["sl"],
-                            "tp": sig["tp"],
-                            "status": "OPEN"
-                        })
+                if len(trades) > 50:
+                    trades[:] = trades[-50:]
 
-                        # 🔥 LIMIT TRADES
-                        if len(trades) > 50:
-                            trades[:] = trades[-50:]
-
-                        send_telegram_signal(sig)
+                send_telegram_signal(sig)
 
         except Exception as e:
-            print("Reconnect...", e)
-            await asyncio.sleep(3)
+            print("Error:", e)
+
+        await asyncio.sleep(10)  # 🔥 10 sec polling
 
 
 # ===== API =====
