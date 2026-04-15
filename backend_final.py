@@ -161,41 +161,35 @@ def get_stats():
 # ===== MAIN LOOP (REST API SAFE) =====
 async def stream(pair):
 
-    url = f"https://api.exchange.coinbase.com/products/BTC-USDT/candles?granularity=60"
+    url = "https://api.exchange.coinbase.com/products/BTC-USDT/candles?granularity=60"
+
     while True:
         try:
             res = requests.get(url, timeout=5)
 
-            # ✅ check response
             if res.status_code != 200:
-                print("API ERROR:", res.text)
+                print("API ERROR")
                 await asyncio.sleep(10)
                 continue
 
             data = res.json()
 
-            # ✅ validate data
             if not isinstance(data, list) or len(data) < 50:
-                print("INVALID DATA:", data)
+                print("BAD DATA")
                 await asyncio.sleep(10)
                 continue
 
             closes = []
 
-            for candle in data:
-                if len(candle) > 4:
-                    try:
-                        closes.append(float(candle[4]))
-                    except:
-                        continue
+            for c in data:
+                if len(c) > 4:
+                    closes.append(float(c[4]))
 
-            # ✅ ensure enough data
+            closes.reverse()
+
             if len(closes) < 50:
-                print("NOT ENOUGH VALID CANDLES")
                 await asyncio.sleep(10)
                 continue
-
-            market_data[pair] = closes
 
             price = closes[-1]
 
@@ -209,12 +203,6 @@ async def stream(pair):
                 if pair in last_signal_time and now - last_signal_time[pair] < COOLDOWN:
                     await asyncio.sleep(5)
                     continue
-
-                if signals:
-                    last = signals[-1]
-                    if abs(sig["entry"] - last["entry"]) / last["entry"] < 0.004:
-                        await asyncio.sleep(5)
-                        continue
 
                 last_signal_time[pair] = now
 
@@ -234,10 +222,9 @@ async def stream(pair):
                 send_signal(sig)
 
         except Exception as e:
-            print("CRITICAL ERROR:", e)
+            print("ERROR:", e)
 
-        await asyncio.sleep(12)
-
+        await asyncio.sleep(15)
 
 # ===== API =====
 @app.get("/")
