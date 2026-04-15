@@ -161,8 +161,7 @@ def get_stats():
 # ===== MAIN LOOP (REST API SAFE) =====
 async def stream(pair):
 
-    url = f"https://api.binance.com/api/v3/klines?symbol={pair.upper()}&interval=1m&limit=100"
-
+    url = f"https://api.exchange.coinbase.com/products/BTC-USDT/candles?granularity=60"
     while True:
         try:
             res = requests.get(url, timeout=5)
