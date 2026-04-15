@@ -1,4 +1,4 @@
-import asyncio, json, websockets, requests, time
+import asyncio, json, websockets, requests, time, os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -12,7 +12,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-pairs = ["btcusdt", "ethusdt", "bnbusdt"]
+# 🔥 USE ONLY 1 PAIR (IMPORTANT FOR MEMORY)
+pairs = ["btcusdt"]
 
 market_data = {}
 signals = []
@@ -21,10 +22,10 @@ trades = []
 COOLDOWN = 180
 last_signal_time = {}
 
-# ===== TELEGRAM CONFIG =====
-BOT_TOKEN = "8790151434:AAH_qgxdAP8kJGyAv6EIoQ7QMRvtp7Mttl4"
-CHAT_ID = "881051504"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
+# ===== TELEGRAM =====
 def send_telegram_signal(sig):
     if not BOT_TOKEN:
         return
@@ -32,109 +33,81 @@ def send_telegram_signal(sig):
     msg = f"""
 🚀 SMC SIGNAL
 
-📊 Pair: {sig['pair']}
-📈 Type: {sig['signal']}
+📊 {sig['pair']} {sig['signal']}
 
 💰 Entry: {round(sig['entry'],2)}
 🛑 SL: {round(sig['sl'],2)}
 🎯 TP: {round(sig['tp'],2)}
 
-⚖️ RR: 1:3
-🔥 Setup: OB + Sweep + Trend
-
-⏰ {time.strftime('%H:%M:%S')}
+⚖️ RR 1:3
 """
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
 
 
-def send_telegram_close(trade):
+def send_telegram_close(t):
     if not BOT_TOKEN:
         return
 
     msg = f"""
 📊 TRADE CLOSED
 
-{trade['pair']} {trade['signal']}
-
-Result: {trade['status']}
-
-Entry: {round(trade['entry'],2)}
-TP: {round(trade['tp'],2)}
-SL: {round(trade['sl'],2)}
+{t['pair']} {t['signal']}
+Result: {t['status']}
 """
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
 
 
-# ===== SMC STRATEGY =====
+# ===== SMC LOGIC (LIGHT VERSION) =====
 def generate_signal(candles, pair):
 
-    if len(candles) < 120:
+    if len(candles) < 80:
         return None
 
-    closes = [c["close"] for c in candles]
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
+    closes = candles
 
     price = closes[-1]
 
     ema20 = sum(closes[-20:]) / 20
     ema50 = sum(closes[-50:]) / 50
+
     trend = "UP" if ema20 > ema50 else "DOWN"
 
-    recent_high = max(highs[-30:-5])
-    recent_low = min(lows[-30:-5])
+    recent_high = max(closes[-20:-1])
+    recent_low = min(closes[-20:-1])
 
     sweep = None
-    if highs[-1] > recent_high and closes[-1] < recent_high:
+
+    if price > recent_high:
         sweep = "SELL"
-    if lows[-1] < recent_low and closes[-1] > recent_low:
+
+    if price < recent_low:
         sweep = "BUY"
 
     if not sweep:
         return None
 
-    ob = None
-    for i in range(len(candles)-10, len(candles)-2):
-        c = candles[i]
-
-        if c["close"] < c["open"] and candles[i+2]["close"] > c["high"]:
-            ob = ("BUY", c["low"], c["high"])
-
-        if c["close"] > c["open"] and candles[i+2]["close"] < c["low"]:
-            ob = ("SELL", c["low"], c["high"])
-
-    if not ob:
+    # FILTER
+    if sweep == "BUY" and trend != "UP":
         return None
 
-    ob_type, ob_low, ob_high = ob
-
-    mid = (max(highs[-50:]) + min(lows[-50:])) / 2
-    zone = "DISCOUNT" if price < mid else "PREMIUM"
-
-    if sweep != ob_type:
-        return None
-
-    if sweep == "BUY" and (trend != "UP" or zone != "DISCOUNT"):
-        return None
-
-    if sweep == "SELL" and (trend != "DOWN" or zone != "PREMIUM"):
+    if sweep == "SELL" and trend != "DOWN":
         return None
 
     entry = price
 
     if sweep == "BUY":
-        sl = ob_low * 0.998
-        tp = price + (price - sl) * 3
+        sl = price * 0.995
+        tp = price * 1.02
     else:
-        sl = ob_high * 1.002
-        tp = price - (sl - price) * 3
+        sl = price * 1.005
+        tp = price * 0.98
 
     move = abs(price - closes[-2]) / closes[-2] * 100
-    if move < 0.2:
+    if move < 0.15:
         return None
 
     return {
@@ -148,10 +121,10 @@ def generate_signal(candles, pair):
     }
 
 
-# ===== TRADE TRACKING =====
-def update_trades(pair, price):
+# ===== TRADE TRACK =====
+def update_trades(price):
     for t in trades:
-        if t["pair"] != pair.upper() or t["status"] != "OPEN":
+        if t["status"] != "OPEN":
             continue
 
         if t["signal"] == "BUY":
@@ -187,7 +160,7 @@ def get_stats():
     }
 
 
-# ===== STREAM =====
+# ===== STREAM (LOW MEMORY + RECONNECT) =====
 async def stream(pair):
 
     url = f"wss://stream.binance.com:9443/ws/{pair}@kline_1m"
@@ -201,23 +174,15 @@ async def stream(pair):
 
                 while True:
                     data = json.loads(await ws.recv())
-                    k = data["k"]
+                    price = float(data["k"]["c"])
 
-                    candle = {
-                        "open": float(k["o"]),
-                        "high": float(k["h"]),
-                        "low": float(k["l"]),
-                        "close": float(k["c"])
-                    }
+                    market_data[pair].append(price)
 
-                    market_data[pair].append(candle)
+                    # 🔥 LIMIT DATA
+                    if len(market_data[pair]) > 100:
+                        market_data[pair] = market_data[pair][-100:]
 
-                    if len(market_data[pair]) > 150:
-                        market_data[pair].pop(0)
-
-                    price = candle["close"]
-
-                    update_trades(pair, price)
+                    update_trades(price)
 
                     sig = generate_signal(market_data[pair], pair)
 
@@ -238,6 +203,10 @@ async def stream(pair):
 
                         signals.append(sig)
 
+                        # 🔥 LIMIT SIGNALS
+                        if len(signals) > 30:
+                            signals[:] = signals[-30:]
+
                         trades.append({
                             "pair": sig["pair"],
                             "signal": sig["signal"],
@@ -247,10 +216,14 @@ async def stream(pair):
                             "status": "OPEN"
                         })
 
+                        # 🔥 LIMIT TRADES
+                        if len(trades) > 50:
+                            trades[:] = trades[-50:]
+
                         send_telegram_signal(sig)
 
         except Exception as e:
-            print("Reconnect...", pair, e)
+            print("Reconnect...", e)
             await asyncio.sleep(3)
 
 
@@ -261,11 +234,11 @@ def home():
 
 @app.get("/signals")
 def get_signals():
-    return signals[-10:]
+    return signals
 
 @app.get("/trades")
 def get_trades():
-    return trades[-20:]
+    return trades
 
 @app.get("/stats")
 def stats():
