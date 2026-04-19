@@ -16,6 +16,29 @@ PORT       = int(os.environ.get('PORT', 8080))
 SCAN_EVERY = int(os.environ.get('SCAN_EVERY', 1))
 COOLDOWN_M = int(os.environ.get('COOLDOWN_M', 45))
 GOLD_YF    = 'https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF'
+
+# Crypto pairs for scalp signals
+CRYPTO_PAIRS = [
+    {'sym':'BTC',  'kr':'XXBTZUSD', 'cg':'bitcoin'},
+    {'sym':'ETH',  'kr':'XETHZUSD', 'cg':'ethereum'},
+    {'sym':'SOL',  'kr':'SOLUSD',   'cg':'solana'},
+    {'sym':'BNB',  'kr':'BNBUSD',   'cg':'binancecoin'},
+    {'sym':'ADA',  'kr':'ADAUSD',   'cg':'cardano'},
+    {'sym':'LINK', 'kr':'LINKUSD',  'cg':'chainlink'},
+    {'sym':'AVAX', 'kr':'AVAXUSD',  'cg':'avalanche-2'},
+    {'sym':'XRP',  'kr':'XXRPZUSD', 'cg':'ripple'},
+    {'sym':'DOGE', 'kr':'XDGUSD',   'cg':'dogecoin'},
+    {'sym':'DOT',  'kr':'DOTUSD',   'cg':'polkadot'},
+]
+KR  = 'https://api.kraken.com/0/public'
+CG  = 'https://api.coingecko.com/api/v3'
+
+# Crypto scalp config
+CRYPTO_SCALP_MIN_SCORE = float(os.environ.get('CRYPTO_SCALP_MIN_SCORE', '8.5'))
+CRYPTO_SCALP_DAILY_CAP = int(os.environ.get('CRYPTO_SCALP_DAILY_CAP',   '3'))   # max per coin/day
+CRYPTO_SCALP_TP1       = float(os.environ.get('CRYPTO_SCALP_TP1',       '1.5'))
+CRYPTO_SCALP_TP2       = float(os.environ.get('CRYPTO_SCALP_TP2',       '2.0'))
+CRYPTO_SCALP_MAX_SL    = float(os.environ.get('CRYPTO_SCALP_MAX_SL',    '0.008')) # 0.8%
 GOLD_MIN_SCORE = float(os.environ.get('GOLD_MIN_SCORE', 6.0))
 SCALP_MODE   = os.environ.get('SCALP_MODE','true').lower()=='true'
 PAPER_MODE   = os.environ.get('PAPER_MODE','true').lower()=='true'  # true = observe only, don't track as real trades
@@ -1761,12 +1784,551 @@ CG = 'https://api.coingecko.com/api/v3'
 
 # Override file paths for gold
 import os as _os
-_os.environ.setdefault('LEARN_FILE', '/app/gold_learning.json')
-_os.environ.setdefault('DEEP_LEARN_FILE', '/app/gold_deep.json')
-_os.environ.setdefault('JOURNAL_FILE', '/app/gold_journal.json')
+_os.environ.setdefault('LEARN_FILE',       '/app/gold_learning.json')
+_os.environ.setdefault('DEEP_LEARN_FILE',  '/app/gold_deep.json')
+_os.environ.setdefault('JOURNAL_FILE',     '/app/gold_journal.json')
 LEARN_FILE      = _os.environ['LEARN_FILE']
 DEEP_LEARN_FILE = _os.environ['DEEP_LEARN_FILE']
 JOURNAL_FILE    = _os.environ['JOURNAL_FILE']
+
+# Separate scalp ML database
+SCALP_LEARN_FILE = os.environ.get('SCALP_LEARN_FILE', '/app/gold_scalp_ml.json')
+
+def _scalp_load():
+    try:
+        if Path(SCALP_LEARN_FILE).exists():
+            with open(SCALP_LEARN_FILE) as f: return json.load(f)
+    except: pass
+    return {
+        'version': 1,
+        'trades': [],
+        'total': 0, 'wins': 0, 'losses': 0, 'be': 0,
+        # ML feature weights — adjusted automatically after each trade
+        'weights': {
+            'session_london':    1.0,  # London session multiplier
+            'session_ny':        1.0,  # NY session multiplier
+            'session_asian':     0.6,  # Asian = worse for scalps
+            'rsi_oversold':      1.2,  # RSI < 35 for buys
+            'rsi_neutral':       1.0,  # RSI 35-55
+            'rsi_overbought':    1.2,  # RSI > 65 for sells
+            'vol_high':          1.2,  # volume > 1.5x avg
+            'vol_normal':        1.0,  # volume 1.0-1.5x avg
+            'ema_aligned':       1.1,  # EMA stack aligned
+            'ob_present':        1.2,  # OB zone confirmed
+            'sweep_present':     1.2,  # sweep detected
+            'macd_aligned':      1.1,  # MACD confirms
+            'weekly_aligned':    1.1,  # weekly bias matches
+            'weekly_against':    0.7,  # weekly bias against
+            'base_score_8':      1.0,  # score 8.0-8.4
+            'base_score_85':     1.1,  # score 8.5-8.9
+            'base_score_9':      1.3,  # score 9.0+
+        },
+        'insights': [],   # patterns discovered
+        'last_update': None,
+        'update_count': 0,
+    }
+
+def _scalp_save(db):
+    try:
+        with open(SCALP_LEARN_FILE, 'w') as f: json.dump(db, f, indent=2)
+    except Exception as e:
+        log.debug(f"Scalp ML save: {e}")
+
+def scalp_adjusted_score(sig, session):
+    """
+    Apply learned ML weights to raw signal score.
+    Returns adjusted confidence score 0-100.
+    """
+    db = _scalp_load()
+    w  = db['weights']
+    base = sig['score']
+
+    # Session weight
+    sess_w = w.get(f'session_{session.lower().replace(" ","_")}',
+                   w.get('session_london', 1.0))
+
+    # RSI weight
+    ri = sig.get('rsi_val', 50)
+    is_buy = sig['dir'] == 'BUY'
+    if is_buy:
+        rsi_w = w['rsi_oversold'] if ri<35 else (w['rsi_neutral'] if ri<55 else 0.8)
+    else:
+        rsi_w = w['rsi_overbought'] if ri>65 else (w['rsi_neutral'] if ri>45 else 0.8)
+
+    # Feature weights
+    tags = sig.get('tags', [])
+    vol_w   = w['vol_high']   if any('Vol++' in t for t in tags) else w['vol_normal']
+    ema_w   = w['ema_aligned'] if any('EMA' in t for t in tags) else 1.0
+    ob_w    = w['ob_present']  if 'OB_Retest' in tags else 1.0
+    sw_w    = w['sweep_present'] if any('Sweep' in t for t in tags) else 1.0
+    macd_w  = w['macd_aligned'] if any('MACD' in t for t in tags) else 1.0
+
+    # Weekly weight
+    weekly = sig.get('weekly', 'neutral')
+    wk_w = w['weekly_aligned'] if (
+        (is_buy and weekly=='bullish') or (not is_buy and weekly=='bearish')
+    ) else (w['weekly_against'] if (
+        (is_buy and weekly=='bearish') or (not is_buy and weekly=='bullish')
+    ) else 1.0)
+
+    # Score tier weight
+    sc_w = w['base_score_9'] if base>=9 else (w['base_score_85'] if base>=8.5 else w['base_score_8'])
+
+    # Combined adjusted score
+    multiplier = (sess_w * rsi_w * vol_w * ema_w * ob_w * sw_w * macd_w * wk_w * sc_w) ** (1/9)
+    adjusted = round(min(100, base * multiplier * 10), 1)
+
+    db_stats = db['weights']
+    log.debug(f"Scalp score: raw={base} sess_w={sess_w:.2f} adj={adjusted}")
+    return adjusted
+
+def scalp_record_trade(sig, session, result, pnl, kl=None):
+    """
+    Record scalp trade result and update ML weights.
+    Called after every scalp TP/SL hit.
+    """
+    db = _scalp_load()
+    tags = sig.get('tags', [])
+    ri = sig.get('rsi_val', 50)
+    is_buy = sig['dir'] == 'BUY'
+    weekly = sig.get('weekly', 'neutral')
+
+    record = {
+        'time':     datetime.now(timezone.utc).isoformat(),
+        'sym':      sig.get('sym', 'XAU'),
+        'dir':      sig['dir'],
+        'setup':    sig.get('setup', ''),
+        'score':    sig.get('score', 0),
+        'session':  session,
+        'rsi':      ri,
+        'weekly':   weekly,
+        'tags':     tags,
+        'result':   result,  # 'win' | 'loss' | 'be'
+        'pnl':      pnl,
+    }
+    db['trades'].append(record)
+    db['total']  += 1
+    if result=='win':    db['wins']   += 1
+    elif result=='loss': db['losses'] += 1
+    else:                db['be']     += 1
+
+    # ── ML WEIGHT UPDATE ───────────────────────────────────────────
+    # Update after every 5 trades (enough data to be meaningful)
+    if db['total'] >= 5 and db['total'] % 5 == 0:
+        _update_scalp_weights(db)
+
+    _scalp_save(db)
+    return record
+
+def _update_scalp_weights(db):
+    """
+    Bayesian-style weight update.
+    Good condition → increase weight
+    Bad condition  → decrease weight
+    Learning rate = 0.12 (conservative)
+    """
+    trades = db['trades']
+    if len(trades) < 5: return
+
+    lr = 0.12  # learning rate
+    w  = db['weights']
+    changes = []
+
+    def wr_for(condition_fn):
+        """Win rate for trades where condition is true"""
+        subset = [t for t in trades if condition_fn(t)]
+        if len(subset) < 3: return None
+        wins = sum(1 for t in subset if t['result']=='win')
+        return wins / len(subset), len(subset)
+
+    # Session learning
+    for sess_key, condition in [
+        ('session_london',  lambda t: t['session']=='London'),
+        ('session_ny',      lambda t: t['session']=='New York'),
+        ('session_asian',   lambda t: t['session']=='Asian'),
+    ]:
+        result = wr_for(condition)
+        if result:
+            wr, n = result
+            target = 0.5 + wr * 1.0  # map WR to multiplier
+            old = w[sess_key]
+            w[sess_key] = round(max(0.3, min(1.8, old + lr*(target-old))), 3)
+            if abs(w[sess_key]-old) > 0.02:
+                changes.append(f"session_{sess_key}: {old:.2f}→{w[sess_key]:.2f} (WR:{wr:.0%} n={n})")
+
+    # RSI zone learning
+    for rsi_key, condition in [
+        ('rsi_oversold',   lambda t: (t['dir']=='BUY' and t['rsi']<35) or (t['dir']=='SELL' and t['rsi']>65)),
+        ('rsi_neutral',    lambda t: 35<=t['rsi']<=65),
+    ]:
+        result = wr_for(condition)
+        if result:
+            wr, n = result
+            target = 0.5 + wr
+            old = w[rsi_key]
+            w[rsi_key] = round(max(0.5, min(2.0, old + lr*(target-old))), 3)
+            if abs(w[rsi_key]-old) > 0.02:
+                changes.append(f"{rsi_key}: {old:.2f}→{w[rsi_key]:.2f} (WR:{wr:.0%})")
+
+    # Volume learning
+    result_hvol = wr_for(lambda t: any('Vol++' in x for x in t.get('tags',[])))
+    if result_hvol:
+        wr, n = result_hvol
+        target = 0.5 + wr
+        old = w['vol_high']
+        w['vol_high'] = round(max(0.5, min(2.0, old + lr*(target-old))), 3)
+        if abs(w['vol_high']-old) > 0.02:
+            changes.append(f"vol_high: {old:.2f}→{w['vol_high']:.2f} (WR:{wr:.0%})")
+
+    # OB learning
+    result_ob = wr_for(lambda t: 'OB_Retest' in t.get('tags',[]))
+    if result_ob:
+        wr, n = result_ob
+        target = 0.5 + wr
+        old = w['ob_present']
+        w['ob_present'] = round(max(0.5, min(2.0, old + lr*(target-old))), 3)
+        if abs(w['ob_present']-old) > 0.02:
+            changes.append(f"ob_present: {old:.2f}→{w['ob_present']:.2f} (WR:{wr:.0%})")
+
+    # Sweep learning
+    result_sw = wr_for(lambda t: any('Sweep' in x for x in t.get('tags',[])))
+    if result_sw:
+        wr, n = result_sw
+        target = 0.5 + wr
+        old = w['sweep_present']
+        w['sweep_present'] = round(max(0.5, min(2.0, old + lr*(target-old))), 3)
+        if abs(w['sweep_present']-old) > 0.02:
+            changes.append(f"sweep_present: {old:.2f}→{w['sweep_present']:.2f} (WR:{wr:.0%})")
+
+    # Score tier learning
+    for sc_key, condition in [
+        ('base_score_9',   lambda t: t['score']>=9.0),
+        ('base_score_85',  lambda t: 8.5<=t['score']<9.0),
+        ('base_score_8',   lambda t: 8.0<=t['score']<8.5),
+    ]:
+        result = wr_for(condition)
+        if result:
+            wr, n = result
+            target = 0.5 + wr
+            old = w[sc_key]
+            w[sc_key] = round(max(0.5, min(2.0, old + lr*(target-old))), 3)
+            if abs(w[sc_key]-old) > 0.02:
+                changes.append(f"{sc_key}: {old:.2f}→{w[sc_key]:.2f} (WR:{wr:.0%})")
+
+    db['update_count'] += 1
+    db['last_update']   = datetime.now(timezone.utc).isoformat()
+
+    if changes:
+        insight = {
+            'time':    datetime.now(timezone.utc).isoformat(),
+            'trades':  db['total'],
+            'changes': changes,
+        }
+        db['insights'].append(insight)
+        log.info(f"Scalp ML updated: {len(changes)} weight changes after {db['total']} trades")
+
+def scalp_ml_report():
+    db = _scalp_load()
+    total = db['total']
+    if total == 0: return "No scalp trades yet."
+    wins = db['wins']; losses = db['losses']; be = db['be']
+    wr = wins/total*100 if total else 0
+    w = db['weights']
+    now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')
+    parts = [
+        "<b>Scalp ML Learning Report</b>",
+        "Based on " + str(total) + " real scalp trades",
+        "",
+        "Wins: " + str(wins) + "  Losses: " + str(losses) + "  BE: " + str(be),
+        "Win rate: " + str(round(wr,1)) + "%",
+        "",
+        "<b>Learned Weights:</b>",
+        "  London:      " + str(w['session_london']) + "x",
+        "  New York:    " + str(w['session_ny']) + "x",
+        "  Asian:       " + str(w['session_asian']) + "x",
+        "  RSI extreme: " + str(w['rsi_oversold']) + "x",
+        "  Volume high: " + str(w['vol_high']) + "x",
+        "  OB zone:     " + str(w['ob_present']) + "x",
+        "  Sweep:       " + str(w['sweep_present']) + "x",
+        "  Score 9+:    " + str(w['base_score_9']) + "x",
+    ]
+    if db['insights']:
+        last = db['insights'][-1]
+        parts.append("")
+        parts.append("<b>Last ML update (" + last['time'][:10] + "):</b>")
+        for ch in last['changes'][:4]:
+            parts.append("  " + ch)
+    parts.append("")
+    parts.append(now_str + " UTC | SMC Gold Scalp ML")
+    return '\n'.join(parts)
+
+def _scalp_load():
+    try:
+        if Path(SCALP_LEARN_FILE).exists():
+            with open(SCALP_LEARN_FILE) as f: return json.load(f)
+    except: pass
+    return {
+        'version': 1,
+        'trades': [],
+        'total': 0, 'wins': 0, 'losses': 0, 'be': 0,
+        # ML feature weights — adjusted automatically after each trade
+        'weights': {
+            'session_london':    1.0,  # London session multiplier
+            'session_ny':        1.0,  # NY session multiplier
+            'session_asian':     0.6,  # Asian = worse for scalps
+            'rsi_oversold':      1.2,  # RSI < 35 for buys
+            'rsi_neutral':       1.0,  # RSI 35-55
+            'rsi_overbought':    1.2,  # RSI > 65 for sells
+            'vol_high':          1.2,  # volume > 1.5x avg
+            'vol_normal':        1.0,  # volume 1.0-1.5x avg
+            'ema_aligned':       1.1,  # EMA stack aligned
+            'ob_present':        1.2,  # OB zone confirmed
+            'sweep_present':     1.2,  # sweep detected
+            'macd_aligned':      1.1,  # MACD confirms
+            'weekly_aligned':    1.1,  # weekly bias matches
+            'weekly_against':    0.7,  # weekly bias against
+            'base_score_8':      1.0,  # score 8.0-8.4
+            'base_score_85':     1.1,  # score 8.5-8.9
+            'base_score_9':      1.3,  # score 9.0+
+        },
+        'insights': [],   # patterns discovered
+        'last_update': None,
+        'update_count': 0,
+    }
+
+def _scalp_save(db):
+    try:
+        with open(SCALP_LEARN_FILE, 'w') as f: json.dump(db, f, indent=2)
+    except Exception as e:
+        log.debug(f"Scalp ML save: {e}")
+
+def scalp_adjusted_score(sig, session):
+    """
+    Apply learned ML weights to raw signal score.
+    Returns adjusted confidence score 0-100.
+    """
+    db = _scalp_load()
+    w  = db['weights']
+    base = sig['score']
+
+    # Session weight
+    sess_w = w.get(f'session_{session.lower().replace(" ","_")}',
+                   w.get('session_london', 1.0))
+
+    # RSI weight
+    ri = sig.get('rsi_val', 50)
+    is_buy = sig['dir'] == 'BUY'
+    if is_buy:
+        rsi_w = w['rsi_oversold'] if ri<35 else (w['rsi_neutral'] if ri<55 else 0.8)
+    else:
+        rsi_w = w['rsi_overbought'] if ri>65 else (w['rsi_neutral'] if ri>45 else 0.8)
+
+    # Feature weights
+    tags = sig.get('tags', [])
+    vol_w   = w['vol_high']   if any('Vol++' in t for t in tags) else w['vol_normal']
+    ema_w   = w['ema_aligned'] if any('EMA' in t for t in tags) else 1.0
+    ob_w    = w['ob_present']  if 'OB_Retest' in tags else 1.0
+    sw_w    = w['sweep_present'] if any('Sweep' in t for t in tags) else 1.0
+    macd_w  = w['macd_aligned'] if any('MACD' in t for t in tags) else 1.0
+
+    # Weekly weight
+    weekly = sig.get('weekly', 'neutral')
+    wk_w = w['weekly_aligned'] if (
+        (is_buy and weekly=='bullish') or (not is_buy and weekly=='bearish')
+    ) else (w['weekly_against'] if (
+        (is_buy and weekly=='bearish') or (not is_buy and weekly=='bullish')
+    ) else 1.0)
+
+    # Score tier weight
+    sc_w = w['base_score_9'] if base>=9 else (w['base_score_85'] if base>=8.5 else w['base_score_8'])
+
+    # Combined adjusted score
+    multiplier = (sess_w * rsi_w * vol_w * ema_w * ob_w * sw_w * macd_w * wk_w * sc_w) ** (1/9)
+    adjusted = round(min(100, base * multiplier * 10), 1)
+
+    db_stats = db['weights']
+    log.debug(f"Scalp score: raw={base} sess_w={sess_w:.2f} adj={adjusted}")
+    return adjusted
+
+def scalp_record_trade(sig, session, result, pnl, kl=None):
+    """
+    Record scalp trade result and update ML weights.
+    Called after every scalp TP/SL hit.
+    """
+    db = _scalp_load()
+    tags = sig.get('tags', [])
+    ri = sig.get('rsi_val', 50)
+    is_buy = sig['dir'] == 'BUY'
+    weekly = sig.get('weekly', 'neutral')
+
+    record = {
+        'time':     datetime.now(timezone.utc).isoformat(),
+        'sym':      sig.get('sym', 'XAU'),
+        'dir':      sig['dir'],
+        'setup':    sig.get('setup', ''),
+        'score':    sig.get('score', 0),
+        'session':  session,
+        'rsi':      ri,
+        'weekly':   weekly,
+        'tags':     tags,
+        'result':   result,  # 'win' | 'loss' | 'be'
+        'pnl':      pnl,
+    }
+    db['trades'].append(record)
+    db['total']  += 1
+    if result=='win':    db['wins']   += 1
+    elif result=='loss': db['losses'] += 1
+    else:                db['be']     += 1
+
+    # ── ML WEIGHT UPDATE ───────────────────────────────────────────
+    # Update after every 5 trades (enough data to be meaningful)
+    if db['total'] >= 5 and db['total'] % 5 == 0:
+        _update_scalp_weights(db)
+
+    _scalp_save(db)
+    return record
+
+def _update_scalp_weights(db):
+    """
+    Bayesian-style weight update.
+    Good condition → increase weight
+    Bad condition  → decrease weight
+    Learning rate = 0.12 (conservative)
+    """
+    trades = db['trades']
+    if len(trades) < 5: return
+
+    lr = 0.12  # learning rate
+    w  = db['weights']
+    changes = []
+
+    def wr_for(condition_fn):
+        """Win rate for trades where condition is true"""
+        subset = [t for t in trades if condition_fn(t)]
+        if len(subset) < 3: return None
+        wins = sum(1 for t in subset if t['result']=='win')
+        return wins / len(subset), len(subset)
+
+    # Session learning
+    for sess_key, condition in [
+        ('session_london',  lambda t: t['session']=='London'),
+        ('session_ny',      lambda t: t['session']=='New York'),
+        ('session_asian',   lambda t: t['session']=='Asian'),
+    ]:
+        result = wr_for(condition)
+        if result:
+            wr, n = result
+            target = 0.5 + wr * 1.0  # map WR to multiplier
+            old = w[sess_key]
+            w[sess_key] = round(max(0.3, min(1.8, old + lr*(target-old))), 3)
+            if abs(w[sess_key]-old) > 0.02:
+                changes.append(f"session_{sess_key}: {old:.2f}→{w[sess_key]:.2f} (WR:{wr:.0%} n={n})")
+
+    # RSI zone learning
+    for rsi_key, condition in [
+        ('rsi_oversold',   lambda t: (t['dir']=='BUY' and t['rsi']<35) or (t['dir']=='SELL' and t['rsi']>65)),
+        ('rsi_neutral',    lambda t: 35<=t['rsi']<=65),
+    ]:
+        result = wr_for(condition)
+        if result:
+            wr, n = result
+            target = 0.5 + wr
+            old = w[rsi_key]
+            w[rsi_key] = round(max(0.5, min(2.0, old + lr*(target-old))), 3)
+            if abs(w[rsi_key]-old) > 0.02:
+                changes.append(f"{rsi_key}: {old:.2f}→{w[rsi_key]:.2f} (WR:{wr:.0%})")
+
+    # Volume learning
+    result_hvol = wr_for(lambda t: any('Vol++' in x for x in t.get('tags',[])))
+    if result_hvol:
+        wr, n = result_hvol
+        target = 0.5 + wr
+        old = w['vol_high']
+        w['vol_high'] = round(max(0.5, min(2.0, old + lr*(target-old))), 3)
+        if abs(w['vol_high']-old) > 0.02:
+            changes.append(f"vol_high: {old:.2f}→{w['vol_high']:.2f} (WR:{wr:.0%})")
+
+    # OB learning
+    result_ob = wr_for(lambda t: 'OB_Retest' in t.get('tags',[]))
+    if result_ob:
+        wr, n = result_ob
+        target = 0.5 + wr
+        old = w['ob_present']
+        w['ob_present'] = round(max(0.5, min(2.0, old + lr*(target-old))), 3)
+        if abs(w['ob_present']-old) > 0.02:
+            changes.append(f"ob_present: {old:.2f}→{w['ob_present']:.2f} (WR:{wr:.0%})")
+
+    # Sweep learning
+    result_sw = wr_for(lambda t: any('Sweep' in x for x in t.get('tags',[])))
+    if result_sw:
+        wr, n = result_sw
+        target = 0.5 + wr
+        old = w['sweep_present']
+        w['sweep_present'] = round(max(0.5, min(2.0, old + lr*(target-old))), 3)
+        if abs(w['sweep_present']-old) > 0.02:
+            changes.append(f"sweep_present: {old:.2f}→{w['sweep_present']:.2f} (WR:{wr:.0%})")
+
+    # Score tier learning
+    for sc_key, condition in [
+        ('base_score_9',   lambda t: t['score']>=9.0),
+        ('base_score_85',  lambda t: 8.5<=t['score']<9.0),
+        ('base_score_8',   lambda t: 8.0<=t['score']<8.5),
+    ]:
+        result = wr_for(condition)
+        if result:
+            wr, n = result
+            target = 0.5 + wr
+            old = w[sc_key]
+            w[sc_key] = round(max(0.5, min(2.0, old + lr*(target-old))), 3)
+            if abs(w[sc_key]-old) > 0.02:
+                changes.append(f"{sc_key}: {old:.2f}→{w[sc_key]:.2f} (WR:{wr:.0%})")
+
+    db['update_count'] += 1
+    db['last_update']   = datetime.now(timezone.utc).isoformat()
+
+    if changes:
+        insight = {
+            'time':    datetime.now(timezone.utc).isoformat(),
+            'trades':  db['total'],
+            'changes': changes,
+        }
+        db['insights'].append(insight)
+        log.info(f"Scalp ML updated: {len(changes)} weight changes after {db['total']} trades")
+
+def scalp_ml_report():
+    """Telegram report of scalp ML learning"""
+    db = _scalp_load()
+    total = db['total']; w = db['total']
+    if total == 0: return "📊 No scalp trades yet."
+
+    wins = db['wins']; losses = db['losses']; be = db['be']
+    wr = wins/total*100 if total else 0
+    weights = db['weights']
+
+    lines = [
+        "🤖 <b>Scalp ML Learning Report</b>",
+        f"Based on {total} real scalp trades",
+        f"✅ Wins: {wins}  ❌ Losses: {losses}  ➡️ BE: {be}",
+        f"Win rate: {wr:.1f}%",
+        "<b>📊 Learned Weights:</b>",
+        f"  London:    {weights['session_london']:.2f}x",
+        f"  New York:  {weights['session_ny']:.2f}x",
+        f"  Asian:     {weights['session_asian']:.2f}x",
+        f"  RSI extreme: {weights['rsi_oversold']:.2f}x",
+        f"  Volume high: {weights['vol_high']:.2f}x",
+        f"  OB zone:     {weights['ob_present']:.2f}x",
+        f"  Sweep:       {weights['sweep_present']:.2f}x",
+        f"  Score 9+:    {weights['base_score_9']:.2f}x",
+    ]
+    if db['insights']:
+        last = db['insights'][-1]
+        lines.append(f"<b>Last update ({last['time'][:10]}):</b>")
+        for ch in last['changes'][:4]:
+            lines.append(f"  {ch}")
+
+    lines.append(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M') + ' UTC')
+    lines.append("🏅 <b>SMC Gold Scalp ML</b>")
+    return '\n'.join(lines)
 
 # ═══ INDICATORS ══════════════════════════════════════════════════
 def ema(c, p):
@@ -1931,6 +2493,32 @@ def get_gold_session():
     if 13<=h<=18: return 'New York'
     return 'Asian'
 
+def gold_market_open():
+    """
+    Gold (XAU/USD) market hours UTC:
+    Open:  Sunday 23:00 UTC
+    Close: Friday 21:00 UTC
+    Closed: Fri 21:00 → Sun 23:00 (weekend)
+    """
+    now = datetime.now(timezone.utc)
+    d   = now.weekday()  # 0=Mon ... 6=Sun
+    h   = now.hour
+
+    # Saturday = always closed
+    if d == 5: return False, 'Closed (Saturday)'
+    # Sunday: closed until 23:00
+    if d == 6 and h < 23: return False, f'Closed (Sunday — opens at 23:00 UTC)'
+    # Friday: closes at 21:00
+    if d == 4 and h >= 21: return False, 'Closed (Friday close)'
+
+    sess = get_gold_session()
+    return True, sess
+
+def is_scalp_session():
+    """Scalp only during active sessions — London or NY"""
+    open_, sess = gold_market_open()
+    return open_ and sess in ('London', 'New York')
+
 def htf_bias_fn(kl, i, f=5):
     if i<f*25: return 'neutral'
     htf=[kl[j*f+f-1]['c'] for j in range((i+1)//f)]
@@ -1952,6 +2540,425 @@ state = {
 last_fired = {}
 
 # ═══ GOLD SIGNAL ENGINE ═══════════════════════════════════════════════════
+
+# ═══ CRYPTO SCALP ENGINE ════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
+# CRYPTO SCALP ENGINE
+# Uses existing SMC v3 logic — score ≥ 8.5 = scalp quality
+# Session only (London+NY), max 3 signals/coin/day
+# Self-learning: same scalp ML weights as gold
+# ════════════════════════════════════════════════════════════════
+
+def fetch_crypto_candles(pair, limit=200):
+    """Fetch 1h candles from Kraken → CoinGecko fallback"""
+    try:
+        r = requests.get(f'{KR}/OHLC',
+            params={'pair': pair['kr'], 'interval': 60},
+            timeout=12, headers={'User-Agent':'Mozilla/5.0'})
+        d = r.json()
+        if not d.get('error'):
+            key = next((k for k in d['result'] if k != 'last'), None)
+            raw = d['result'].get(key, [])
+            if len(raw) > 20:
+                return [{'t':int(k[0]),'o':float(k[1]),'h':float(k[2]),
+                         'l':float(k[3]),'c':float(k[4]),'v':float(k[6])}
+                        for k in raw[-limit:]]
+    except: pass
+    try:
+        r = requests.get(f'{CG}/coins/{pair["cg"]}/ohlc',
+            params={'vs_currency':'usd','days':7}, timeout=12)
+        raw = r.json()
+        if isinstance(raw,list) and len(raw)>10:
+            return [{'t':int(k[0]/1000),'o':float(k[1]),'h':float(k[2]),
+                     'l':float(k[3]),'c':float(k[4]),'v':50.0}
+                    for k in raw[-limit:]]
+    except: pass
+    return None
+
+def fetch_crypto_price(pair):
+    """Get current price for TP/SL monitoring"""
+    try:
+        r = requests.get(f'{CG}/simple/price',
+            params={'ids':pair['cg'],'vs_currencies':'usd'}, timeout=8)
+        return float(r.json()[pair['cg']]['usd'])
+    except: return None
+
+def fp_crypto(p):
+    if not p: return '—'
+    if p>=10000: return f'${p:,.0f}'
+    if p>=100:   return f'${p:.2f}'
+    if p>=1:     return f'${p:.4f}'
+    return f'${p:.6f}'
+
+def compute_crypto_scalp(kl, pair):
+    """
+    SMC v3 engine adapted for scalp:
+    - Sweep+OB: score 8-9 (best for scalps, wick-based SL)
+    - CHoCH: score 8 (reversal scalp)
+    - Session required (London/NY)
+    - Anti-trend filter
+    - Max SL 0.8%
+    Returns signal dict or None.
+    """
+    if not kl or len(kl) < 60: return None
+    n = len(kl); i = n-1
+    closes = [k['c'] for k in kl]; vols = [k['v'] for k in kl]
+    ri_a  = rsi(closes);    e9_a  = ema(closes, 9)
+    e20_a = ema(closes, 20); e50_a = ema(closes, 50)
+    ht_a  = macd_hist(closes); at_a = calc_atr(kl); va_a = vol_avg(vols)
+
+    if not all([ri_a[i],e9_a[i],e20_a[i],e50_a[i],at_a[i],va_a[i]]): return None
+
+    price = closes[i]; k = kl[i]
+    at = float(at_a[i]); va = float(va_a[i])
+    ri_v = float(ri_a[i]); e9 = float(e9_a[i])
+    e20  = float(e20_a[i]); e50 = float(e50_a[i]); ht = ht_a[i]
+
+    # Chop filter
+    r_ = [x for x in at_a[max(0,i-20):i] if x]
+    if not r_ or at < sum(r_)/len(r_)*0.40: return None
+
+    sh_, sl_ = swings(kl[:i+1], 5)
+    weekly = htf_bias_fn(kl, i, 21)
+    daily  = htf_bias_fn(kl, i, 5)
+
+    is_buy = None; score = 0.0; tags = []; setup = None; wick_sl = None; ob_hit = None
+
+    # ── SETUP 1: Sweep + OB (priority — best scalp setup) ────────
+    for li, lvl in [(ix,float(p)) for ix,p in sl_ if ix<i-1 and ix>i-50][-4:]:
+        if not(k['l']<lvl<price) or lvl-k['l']<at*0.25 or k['v']<va*1.1: continue
+        if daily != 'bullish' or weekly == 'bearish': continue
+        if not(25<ri_v<65): continue
+        # Anti-trend: skip if 5/6 recent candles are red
+        r6 = kl[max(0,i-6):i+1]
+        if sum(1 for x in r6 if x['c']<x['o']) >= 5: continue
+        ob = None
+        for j in range(li-1, max(0,li-12), -1):
+            if kl[j]['c']<kl[j]['o'] and (kl[min(j+2,n-1)]['c']-kl[j]['c'])/kl[j]['c']>0.003:
+                ob={'top':kl[j]['o'],'bot':kl[j]['l']}; break
+        if not ob or not(ob['bot']<=price<=ob['top']*1.005): continue
+        is_buy=True; setup='SWEEP_OB'; score+=3.5
+        tags+=['Sweep↑','OB_Retest']; wick_sl=k['l']; ob_hit=ob; break
+
+    for hi_, lvl in [(ix,float(p)) for ix,p in sh_ if ix<i-1 and ix>i-50][-4:]:
+        if not(k['h']>lvl>price) or k['h']-lvl<at*0.25 or k['v']<va*1.1: continue
+        if daily != 'bearish' or weekly == 'bullish': continue
+        if not(35<ri_v<75): continue
+        r6 = kl[max(0,i-6):i+1]
+        if sum(1 for x in r6 if x['c']>x['o']) >= 5: continue
+        ob = None
+        for j in range(hi_-1, max(0,hi_-12), -1):
+            if kl[j]['c']>kl[j]['o'] and (kl[min(j+2,n-1)]['c']-kl[j]['c'])/kl[j]['c']<-0.003:
+                ob={'top':kl[j]['h'],'bot':kl[j]['c']}; break
+        if not ob or not(ob['bot']*0.995<=price<=ob['top']): continue
+        is_buy=False; setup='SWEEP_OB'; score+=3.5
+        tags+=['Sweep↓','OB_Retest']; wick_sl=k['h']; ob_hit=ob; break
+
+    # ── SETUP 2: CHoCH Reversal ────────────────────────────────
+    if is_buy is None:
+        rh = [(ix,float(p)) for ix,p in sh_ if ix<=i][-5:]
+        rl = [(ix,float(p)) for ix,p in sl_ if ix<=i][-5:]
+        if len(rh)>=3 and len(rl)>=3:
+            h2,h1p = rh[-2][1],rh[-3][1]; l2,l1p = rl[-2][1],rl[-3][1]
+            vok = k['v'] > va*1.05
+            if abs(h2-h1p)/max(h1p,1)>=0.003 and abs(l2-l1p)/max(l1p,1)>=0.003:
+                if h2<h1p and l2<l1p and price>h2 and ht and ht>0 and 28<ri_v<62 and vok and weekly!='bearish':
+                    is_buy=True; setup='CHOCH'; score+=3.5; tags+=['CHoCH↑']
+                elif h2>h1p and l2>l1p and price<l2 and ht and ht<0 and 38<ri_v<72 and vok and weekly!='bullish':
+                    is_buy=False; setup='CHOCH'; score+=3.5; tags+=['CHoCH↓']
+
+    if is_buy is None: return None
+
+    # ── CONFLUENCES ────────────────────────────────────────────
+    if k['v']>va*1.6:   score+=1.0; tags.append('Vol++')
+    elif k['v']>va*1.2: score+=0.5; tags.append('Vol✓')
+    if is_buy  and price>e20>e50: score+=1.0; tags.append('EMA↑')
+    elif not is_buy and price<e20<e50: score+=1.0; tags.append('EMA↓')
+    if ht:
+        if is_buy  and ht>0: score+=0.5; tags.append('MACD+')
+        elif not is_buy and ht<0: score+=0.5; tags.append('MACD-')
+    if is_buy  and ri_v<35: score+=1.0; tags.append(f'RSI{round(ri_v)}')
+    elif is_buy  and ri_v<50: score+=0.5; tags.append(f'RSI{round(ri_v)}')
+    elif not is_buy and ri_v>65: score+=1.0; tags.append(f'RSI{round(ri_v)}')
+    elif not is_buy and ri_v>50: score+=0.5; tags.append(f'RSI{round(ri_v)}')
+    if is_buy  and weekly=='bullish': score+=0.5; tags.append('W:Bull')
+    elif not is_buy and weekly=='bearish': score+=0.5; tags.append('W:Bear')
+    elif (is_buy and weekly=='bearish') or (not is_buy and weekly=='bullish'): score-=1.5
+    if is_buy  and daily=='bullish': score+=0.5; tags.append('D:Bull')
+    elif not is_buy and daily=='bearish': score+=0.5; tags.append('D:Bear')
+    # RSI divergence booster
+    lb=12
+    rl_div=[(ix,float(p)) for ix,p in sl_ if i-lb<ix<i][-3:]
+    if is_buy and len(rl_div)>=2 and ri_a[rl_div[-2][0]] and ri_a[rl_div[-1][0]]:
+        if rl_div[-1][1]<rl_div[-2][1] and ri_a[rl_div[-1][0]]>ri_a[rl_div[-2][0]]:
+            score+=1.5; tags.append('RSI_Div✓')
+
+    score = round(max(0, min(10, score)), 1)
+    if score < CRYPTO_SCALP_MIN_SCORE: return None
+
+    # ── SL: wick-based (tight) ────────────────────────────────
+    if wick_sl is not None:
+        sl_p = wick_sl - at*0.08 if is_buy else wick_sl + at*0.08
+    else:
+        rl2 = [(ix,float(p)) for ix,p in sl_ if ix<=i][-2:]
+        rh2 = [(ix,float(p)) for ix,p in sh_ if ix<=i][-2:]
+        sl_p = (min(p for _,p in rl2)-at*0.08) if (is_buy and rl2) else \
+               (max(p for _,p in rh2)+at*0.08) if (not is_buy and rh2) else \
+               (price-at*1.5 if is_buy else price+at*1.5)
+
+    # Max SL cap
+    if is_buy  and (price-sl_p)>price*CRYPTO_SCALP_MAX_SL: sl_p=price-price*CRYPTO_SCALP_MAX_SL
+    if not is_buy and (sl_p-price)>price*CRYPTO_SCALP_MAX_SL: sl_p=price+price*CRYPTO_SCALP_MAX_SL
+    risk = abs(price-sl_p)
+    if risk <= 0 or risk < price*0.001: return None
+
+    tp1  = price+risk*CRYPTO_SCALP_TP1 if is_buy else price-risk*CRYPTO_SCALP_TP1
+    tp2  = price+risk*CRYPTO_SCALP_TP2 if is_buy else price-risk*CRYPTO_SCALP_TP2
+    tp3  = price+risk*2.5 if is_buy else price-risk*2.5  # runner
+    if abs(tp2-price)/risk < 1.8: return None
+
+    # Apply ML adjusted score
+    sess = get_gold_session()
+    sig_tmp = {'dir':'BUY' if is_buy else 'SELL','score':score,'tags':tags,
+               'rsi_val':round(ri_v,1),'weekly':weekly,'session':sess}
+    ml_conf = scalp_adjusted_score(sig_tmp, sess)
+
+    setup_names = {
+        'SWEEP_OB': '⚡ Sweep+OB Retest',
+        'CHOCH':    '🔄 CHoCH Reversal',
+    }
+    why_map = {
+        'SWEEP_OB': (f"  1️⃣ Retail stops swept at {fp_crypto(wick_sl)}\n"
+                     f"  2️⃣ Closed back above — stop hunt done\n"
+                     f"  3️⃣ OB zone: {fp_crypto(ob_hit['bot'])} – {fp_crypto(ob_hit['top'])}\n" if ob_hit else
+                     "  Sweep+OB retest\n")+
+                    f"  4️⃣ SL below wick — tight risk\n"
+                    f"  💡 Scalp: target TP1 fast, trail to TP2",
+        'CHOCH':    (f"  1️⃣ {'Downtrend' if is_buy else 'Uptrend'} → structure shifted\n"
+                     f"  2️⃣ CHoCH confirmed — {'bullish' if is_buy else 'bearish'} direction\n"
+                     f"  3️⃣ Volume surge + MACD confirmed\n"
+                     f"  💡 Scalp: SL at swing, quick TP1"),
+    }
+
+    return {
+        'sym':        pair['sym'],
+        'name':       pair['sym'],
+        'pair':       f"{pair['sym']}/USD",
+        'dir':        'BUY' if is_buy else 'SELL',
+        'setup':      setup,
+        'setup_name': setup_names.get(setup, setup),
+        'why':        why_map.get(setup, ''),
+        'score':      score,
+        'ml_conf':    ml_conf,
+        'conf':       min(96, round(score*8+min(CRYPTO_SCALP_TP2,3)*2.5)),
+        'rr':         CRYPTO_SCALP_TP2,
+        'price':      price,
+        'entry':      price,
+        'sl':         round(sl_p, 6),
+        'tp1':        round(tp1, 6),
+        'tp':         round(tp2, 6),
+        'tp3':        round(tp3, 6),
+        'risk_pct':   round(risk/price*100, 3),
+        'rew_pct':    round(abs(tp2-price)/price*100, 3),
+        'sl_dollar':  None,
+        'tp1_dollar': None,
+        'tp2_dollar': None,
+        'tags':       tags,
+        'weekly':     weekly,
+        'daily':      daily,
+        'session':    sess,
+        'ob':         ob_hit,
+        'wick_sl':    round(wick_sl, 6) if wick_sl else None,
+        'rsi_val':    round(ri_v, 1),
+        'is_crypto':  True,
+    }
+
+def build_crypto_scalp_msg(sig, count_today, total_today):
+    """Crypto scalp TG message"""
+    ib  = sig['dir'] == 'BUY'
+    e   = sig['entry']
+    risk = abs(e-sig['sl'])
+    tp1d = round(abs(sig['tp1']-e), 6)
+    tp2d = round(abs(sig['tp']-e), 6)
+    tp1p = round(tp1d/e*100, 2)
+    tp2p = round(tp2d/e*100, 2)
+    em   = '⚡' if sig['setup']=='SWEEP_OB' else '🔄'
+
+    return '\n'.join(filter(None, [
+        f"{'🟢' if ib else '🔴'} <b>CRYPTO SCALP {'BUY' if ib else 'SELL'} — {sig['sym']}/USD</b>",
+        f"{em} {sig['setup_name']}  |  Score: {sig['score']}/10  |  ML: {sig['ml_conf']:.0f}%",
+        f"📅 Signal {count_today}/{CRYPTO_SCALP_DAILY_CAP} today  |  Session: {sig['session']}",
+        "",
+        "💰 <b>Scalp Levels</b>",
+        f"  Entry:  <code>{fp_crypto(e)}</code>",
+        f"  SL:     <code>{fp_crypto(sig['sl'])}</code>  <i>(-{sig['risk_pct']}%) — below wick</i>",
+        f"  TP1:    <code>{fp_crypto(sig['tp1'])}</code>  <i>(+{tp1p}% — 1:1.5 — close 70%)</i>",
+        f"  TP2:    <code>{fp_crypto(sig['tp'])}</code>   <i>(+{tp2p}% — 1:2.0 — runner 30%)</i>",
+        f"  TP3:    <code>{fp_crypto(sig['tp3'])}</code>  <i>(1:2.5 — let go)</i>",
+        "",
+        "📖 <b>Why this scalp:</b>",
+        sig['why'],
+        "",
+        f"🔍 {esc(' · '.join(sig['tags']))}",
+        f"Weekly: {sig['weekly']}  |  RSI: {sig['rsi_val']}",
+        sig['ob'] and f"OB: {fp_crypto(sig['ob']['bot'])} – {fp_crypto(sig['ob']['top'])}",
+        "",
+        f"⚡ <i>Scalp — aim for TP1 first. Move SL to entry at TP1.</i>",
+        f"⚠️ <i>Exit at session close if TP not hit.</i>",
+        f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC  |  📡 <b>SMC Crypto Scalp</b>",
+    ]))
+
+def run_crypto_scalp_scan():
+    """
+    Scan all 10 crypto pairs for scalp signals.
+    Only fires during London/NY session.
+    Max 3 scalps/coin/day.
+    Tracks each in open_trades['SCALP_BTC'] etc.
+    """
+    if not is_scalp_session():
+        log.debug("Crypto scalp: not in session — skip")
+        return
+
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    if today != state.get('scalp_crypto_day'):
+        state['scalp_crypto_day']   = today
+        state['scalp_crypto_count'] = {}  # {sym: count}
+
+    signals_sent = 0
+    for pair in CRYPTO_PAIRS:
+        sym = pair['sym']
+        # Daily cap check
+        if state['scalp_crypto_count'].get(sym, 0) >= CRYPTO_SCALP_DAILY_CAP:
+            continue
+        # Cooldown: don't fire same coin twice within COOLDOWN_M
+        lf = last_fired.get(f'SCALP_{sym}', {})
+        if lf and time.time()-lf.get('time',0) < COOLDOWN_M*60:
+            continue
+        # Skip if already in open trade for this coin
+        if f'SCALP_{sym}' in state['open_trades']:
+            continue
+        try:
+            kl = fetch_crypto_candles(pair, limit=200)
+            if not kl or len(kl)<60:
+                log.debug(f"  Crypto scalp {sym}: no data"); continue
+            sig = compute_crypto_scalp(kl, pair)
+            if not sig:
+                log.debug(f"  {sym}: no scalp setup"); continue
+            # ML confidence gate
+            if sig['ml_conf'] < 65:
+                log.debug(f"  {sym}: low ML conf {sig['ml_conf']:.0f}% — skip")
+                continue
+            count = state['scalp_crypto_count'].get(sym, 0) + 1
+            total = sum(state['scalp_crypto_count'].values()) + 1
+            msg = build_crypto_scalp_msg(sig, count, total)
+            ok  = send_tg(msg)
+            if ok:
+                last_fired[f'SCALP_{sym}'] = {'time':time.time(),'price':sig['price']}
+                state['scalp_crypto_count'][sym] = count
+                state['alerts_sent'] = state.get('alerts_sent', 0) + 1
+                sess = get_gold_session()
+                lid  = log_signal(sig, pair, sess)
+                state['open_trades'][f'SCALP_{sym}'] = {
+                    **sig,
+                    'sym':          f'SCALP_{sym}',
+                    'real_sym':     sym,
+                    'pair_obj':     pair,
+                    'time':         datetime.now(timezone.utc).isoformat(),
+                    'be_triggered': False,
+                    'tp2_hit':      False,
+                    'session_name': sess,
+                    'learn_id':     lid,
+                }
+                signals_sent += 1
+                log.info(f"  Scalp {sym}: {sig['setup']} {sig['dir']} score={sig['score']} mlconf={sig['ml_conf']:.0f}% → TG ✓")
+        except Exception as e:
+            log.error(f"  Crypto scalp {sym} error: {e}")
+        time.sleep(0.5)
+
+    if signals_sent:
+        log.info(f"Crypto scalp scan: {signals_sent} signals sent")
+
+def check_crypto_scalp_prices():
+    """Monitor open crypto scalp trades for TP/SL hits"""
+    for trade_key in list(state['open_trades'].keys()):
+        if not trade_key.startswith('SCALP_'): continue
+        trade = state['open_trades'][trade_key]
+        real_sym = trade.get('real_sym', trade_key.replace('SCALP_',''))
+        pair_obj = trade.get('pair_obj')
+        if not pair_obj: continue
+        price = fetch_crypto_price(pair_obj)
+        if not price: continue
+        ib = trade['dir']=='BUY'; en = trade['entry']
+        sl_p=trade['sl']; tp1_p=trade['tp1']; tp2_p=trade['tp']; tp3_p=trade.get('tp3',tp2_p)
+
+        # TP1 — breakeven
+        if not trade.get('be_triggered'):
+            if (ib and price>=tp1_p) or (not ib and price<=tp1_p):
+                trade['be_triggered']=True
+                pnl1=round(abs(tp1_p-en)/en*100,3)
+                send_tg(
+                    f"🎯 <b>SCALP TP1 HIT — {real_sym}/USD +{pnl1}%</b>\n\n"
+                    f"Close 70% at <code>{fp_crypto(price)}</code>\n"
+                    f"Move SL to entry: <code>{fp_crypto(en)}</code>\n"
+                    f"Runner → TP2: <code>{fp_crypto(tp2_p)}</code>\n"
+                    f"Scalp now risk-free!  |  📡 SMC Crypto Scalp"
+                )
+
+        # TP2 — WIN
+        if not trade.get('tp2_hit'):
+            if (ib and price>=tp2_p) or (not ib and price<=tp2_p):
+                trade['tp2_hit']=True
+                pnl=round(abs(tp2_p-en)/en*100,3)
+                send_tg(
+                    f"✅ <b>SCALP WIN — {real_sym}/USD +{pnl}%</b>\n\n"
+                    f"{trade.get('setup_name','—')}\n"
+                    f"Entry {fp_crypto(en)} → Exit {fp_crypto(price)}\n"
+                    f"Held: {_hours_held(trade)}\n\n"
+                    f"🤖 ML learning from this win...\n"
+                    f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC  |  📡 SMC Crypto Scalp"
+                )
+                scalp_record_trade(trade, trade.get('session_name','Unknown'), 'win', pnl)
+                lid=trade.get('learn_id')
+                if lid: close_trade(lid,'win',price)
+                journal_close_trade(real_sym,'win',price)
+                state['stats']['wins']=state['stats'].get('wins',0)+1
+                del state['open_trades'][trade_key]; continue
+
+        # TP3 — Runner
+        if trade.get('tp2_hit') and not trade.get('tp3_hit'):
+            if (ib and price>=tp3_p) or (not ib and price<=tp3_p):
+                trade['tp3_hit']=True; pnl=round(abs(tp3_p-en)/en*100,3)
+                send_tg(f"🚀 <b>SCALP RUNNER — {real_sym}/USD +{pnl}%</b>\nFull exit.  📡 SMC Crypto Scalp")
+                continue
+
+        # SL — LOSS
+        if (ib and price<=sl_p) or (not ib and price>=sl_p):
+            pnl=round(abs(sl_p-en)/en*100,3)
+            tags=trade.get('tags',[]); rsi_v=trade.get('rsi_val',50); weekly=trade.get('weekly','neutral')
+            why=[]
+            if trade['dir']=='BUY' and weekly=='bearish': why.append("BUY vs weekly bearish")
+            if trade['dir']=='SELL' and weekly=='bullish': why.append("SELL vs weekly bullish")
+            if trade['dir']=='BUY' and rsi_v>62: why.append(f"RSI {rsi_v} overbought")
+            if trade['dir']=='SELL' and rsi_v<38: why.append(f"RSI {rsi_v} oversold")
+            if abs(price-en)/en*100<0.2: why.append("Stopped immediately — news/entry timing")
+            reason = '\n'.join(f"  ⚠️ {r}" for r in why) if why else "  Market moved against setup"
+            send_tg(
+                f"❌ <b>SCALP LOSS — {real_sym}/USD -{pnl}%</b>\n\n"
+                f"{trade.get('setup_name','—')}  Score: {trade.get('score',0)}/10\n"
+                f"Entry {fp_crypto(en)} → SL {fp_crypto(price)}\n"
+                f"Held: {_hours_held(trade)}\n\n"
+                f"🔍 <b>Why failed:</b>\n{reason}\n\n"
+                f"🤖 Adjusting ML weights...\n"
+                f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC  |  📡 SMC Crypto Scalp"
+            )
+            scalp_record_trade(trade, trade.get('session_name','Unknown'), 'loss', -pnl)
+            lid=trade.get('learn_id')
+            if lid: close_trade(lid,'loss',price)
+            journal_close_trade(real_sym,'loss',price)
+            state['stats']['losses']=state['stats'].get('losses',0)+1
+            del state['open_trades'][trade_key]
+
+# ════════════════════════════════════════════════════════════
 
 def gold_chop(atr_a, i, thresh=0.40):
     r=[x for x in atr_a[max(0,i-20):i] if x]
@@ -2152,6 +3159,38 @@ def _hours_held(trade):
     except: return '—'
 
 
+def build_scalp_msg(sig):
+    """Scalp-specific TG message — different format from main trade"""
+    ib=sig['dir']=='BUY'; e=sig['entry']
+    sl_d=round(abs(e-sig['sl']),2)
+    tp1_d=round(abs(sig['tp_scalp1']-e),2)
+    tp2_d=round(abs(sig['tp_scalp2']-e),2)
+    emojis={'SWEEP_OB':'⚡','ICT_KZ':'🕯️','CHOCH':'🔄','EMA_PULL':'📊'}
+    em=emojis.get(sig['setup'],'📡')
+    today_count=state['stats'].get('scalp_today',1)
+    ml_conf=sig.get('ml_conf',0)
+    lines=[
+        f"{'🟡' if ib else '🔴'} <b>GOLD SCALP {'BUY' if ib else 'SELL'} #{today_count}/3 — XAU/USD</b>",
+        f"{em} {sig.get('setup_name','Gold Scalp')}  |  Score: {sig['score']}/10  |  ML: {ml_conf:.0f}%",
+        "",
+        f"💰 <b>Scalp Levels</b>",
+        f"  Entry:  <code>${e:.2f}</code>",
+        f"  SL:     <code>${sig['sl']:.2f}</code>  <i>(-${sl_d}) — tight, use limit order</i>",
+        f"  TP1:    <code>${sig['tp_scalp1']:.2f}</code>  <i>(+${tp1_d} — 1:1.5 — close 70%)</i>",
+        f"  TP2:    <code>${sig['tp_scalp2']:.2f}</code>  <i>(+${tp2_d} — 1:2.0 — runner 30%)</i>",
+        "",
+        f"📖 <b>Why scalp:</b>",
+        sig['why'],
+        "",
+        f"🔍 Tags: {esc(' · '.join(sig['tags']))}",
+        f"📅 Session: {sig['session']}  |  RSI: {sig['rsi_val']}  |  Weekly: {sig['weekly']}",
+        "",
+        f"⚡ <i>SCALP — target TP1 fast. Move SL to entry at TP1.</i>",
+        f"⚠️ <i>Max hold: 2-3hrs. Exit at close of London/NY if not hit.</i>",
+        f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC  |  🏅 <b>SMC Gold Scalp</b>",
+    ]
+    return '\n'.join(l for l in lines if l is not None)
+
 def build_gold_msg(sig):
     ib=sig['dir']=='BUY'; e=sig['entry']
     mode=('📋 PAPER' if PAPER_MODE else ('SCALP🎯' if SCALP_MODE else 'SWING📐'))
@@ -2214,7 +3253,86 @@ def _loss_g(t, exit_p):
     return '\n'.join(lines)
 
 # ═══ PRICE MONITOR ══════════════════════════════════════════════════════════
+def _check_scalp_trade():
+    """Monitor scalp trade with faster exit logic"""
+    trade = state['open_trades'].get('XAU_SCALP')
+    if not trade: return
+    price = fetch_gold_price()
+    if not price: return
+    ib=trade['dir']=='BUY'; en=trade['entry']
+    sl_p=trade['sl']; tp1_p=trade['tp1']; tp2_p=trade['tp']
+
+    # TP1 — close 70%, move SL to entry
+    if not trade.get('be_triggered'):
+        if (ib and price>=tp1_p) or (not ib and price<=tp1_p):
+            trade['be_triggered']=True
+            d1=round(abs(tp1_p-en),2); pnl1=round(abs(tp1_p-en)/en*100,3)
+            send_tg(
+                f"🎯 <b>GOLD SCALP TP1 +{pnl1}% (+${d1})</b>\n\n"
+                f"Close 70% at <code>${price:.2f}</code>\n"
+                f"Move SL to entry: <code>${en:.2f}</code>\n"
+                f"Runner 30% → TP2: <code>${tp2_p:.2f}</code>\n"
+                f"⚡ Scalp trade now risk-free!  |  🏅 SMC Gold Scalp"
+            )
+            log.info(f"  Scalp TP1 +{pnl1}%")
+
+    # TP2 — WIN
+    if not trade.get('tp2_hit'):
+        if (ib and price>=tp2_p) or (not ib and price<=tp2_p):
+            trade['tp2_hit']=True; pnl=round(abs(tp2_p-en)/en*100,3); d2=round(abs(tp2_p-en),2)
+            send_tg(
+                f"✅ <b>GOLD SCALP WIN +{pnl}% (+${d2})</b>\n\n"
+                f"Setup: {trade.get('setup_name','—')}\n"
+                f"Entry ${en:.2f} → Exit ${price:.2f}\n"
+                f"Held: {_hours_held(trade)}\n\n"
+                f"🤖 ML learning from this win...\n"
+                f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC  |  🏅 SMC Gold Scalp"
+            )
+            # ML learning
+            scalp_record_trade(trade, trade.get('session_name','Unknown'), 'win', pnl)
+            lid=trade.get('learn_id')
+            if lid: close_trade(lid,'win',price)
+            journal_close_trade('XAU','win',price)
+            state['stats']['wins']=state['stats'].get('wins',0)+1
+            state['stats']['scalp_wins']=state['stats'].get('scalp_wins',0)+1
+            log.info(f"  Scalp WIN +{pnl}%")
+            del state['open_trades']['XAU_SCALP']; return
+
+    # SL — LOSS
+    if (ib and price<=sl_p) or (not ib and price>=sl_p):
+        pnl=round(abs(sl_p-en)/en*100,3); dl=round(abs(sl_p-en),2)
+        # ML failure analysis
+        tags=trade.get('tags',[]); rsi_v=trade.get('rsi_val',50); weekly=trade.get('weekly','neutral')
+        why_loss=[]
+        if ib and weekly=='bearish': why_loss.append("BUY against weekly bearish")
+        if not ib and weekly=='bullish': why_loss.append("SELL against weekly bullish")
+        if ib and rsi_v>62: why_loss.append(f"RSI {rsi_v} overbought for buy")
+        if not ib and rsi_v<38: why_loss.append(f"RSI {rsi_v} oversold for sell")
+        mv=abs(price-en)/en*100
+        if mv<0.15: why_loss.append("Stopped immediately — bad entry timing")
+        reason='\n'.join(f"  ⚠️ {r}" for r in why_loss) if why_loss else "  Market conditions changed"
+        send_tg(
+            f"❌ <b>GOLD SCALP LOSS -{pnl}% (-${dl})</b>\n\n"
+            f"Setup: {trade.get('setup_name','—')}  Score: {trade.get('score',0)}/10\n"
+            f"Entry ${en:.2f} → SL ${price:.2f}\n"
+            f"Held: {_hours_held(trade)}\n\n"
+            f"🔍 <b>Why it failed:</b>\n{reason}\n\n"
+            f"🤖 ML adjusting weights to avoid this...\n"
+            f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC  |  🏅 SMC Gold Scalp"
+        )
+        scalp_record_trade(trade, trade.get('session_name','Unknown'), 'loss', -pnl)
+        lid=trade.get('learn_id')
+        if lid: close_trade(lid,'loss',price)
+        journal_close_trade('XAU','loss',price)
+        state['stats']['losses']=state['stats'].get('losses',0)+1
+        state['stats']['scalp_losses']=state['stats'].get('scalp_losses',0)+1
+        log.info(f"  Scalp LOSS -{pnl}%")
+        del state['open_trades']['XAU_SCALP']
+
 def check_gold_prices():
+    # Check scalp trades first (faster moving)
+    if 'XAU_SCALP' in state['open_trades']:
+        _check_scalp_trade()
     if 'XAU' not in state['open_trades']: return
     trade=state['open_trades']['XAU']
     price=fetch_gold_price()
@@ -2317,12 +3435,66 @@ class Health(BaseHTTPRequestHandler):
 def run_gold_scan():
     state['scans_done']+=1
     state['last_scan']=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-    log.info(f"Gold scan #{state['scans_done']}...")
+
+    # ── Market hours check ─────────────────────────────────────
+    is_open, sess_info = gold_market_open()
+    if not is_open:
+        log.info(f"Gold market closed: {sess_info} — skipping scan")
+        return
+
+    log.info(f"Gold scan #{state['scans_done']} — Session: {sess_info}")
     try:
         kl=fetch_gold_candles(limit=200)
         if not kl: log.warning("Gold: no data"); return
+
+        # ── SCALP SIGNAL (score >= 8.5, session only) ──────────
+        scalp_sig = None
+        if is_scalp_session():
+            # Compute signal then check if it qualifies as scalp
+            raw_sig = compute_gold(kl)
+            if raw_sig and raw_sig['score'] >= 8.5:
+                # Apply ML-adjusted confidence
+                ml_conf = scalp_adjusted_score(raw_sig, sess_info)
+                if ml_conf >= 72:  # ML-weighted threshold
+                    scalp_sig = {**raw_sig, 'trade_type':'SCALP',
+                                 'ml_conf': ml_conf,
+                                 # Scalp targets: faster, tighter
+                                 'tp_scalp1': round(raw_sig['entry'] + abs(raw_sig['entry']-raw_sig['sl'])*1.5,2) if raw_sig['dir']=='BUY'
+                                              else round(raw_sig['entry'] - abs(raw_sig['entry']-raw_sig['sl'])*1.5,2),
+                                 'tp_scalp2': round(raw_sig['entry'] + abs(raw_sig['entry']-raw_sig['sl'])*2.0,2) if raw_sig['dir']=='BUY'
+                                              else round(raw_sig['entry'] - abs(raw_sig['entry']-raw_sig['sl'])*2.0,2),
+                                 }
+                    log.info(f"  Scalp signal: {raw_sig['setup']} {raw_sig['dir']} score={raw_sig['score']} mlconf={ml_conf}")
+
+        # ── MAIN SIGNAL (score >= 6) ────────────────────────────
         sig=compute_gold(kl)
-        if not sig: log.info(f"  No setup (price ${kl[-1]['c']:.2f})"); return
+        # Send scalp signal if found
+        if scalp_sig:
+            lf_s=last_fired.get('XAU_SCALP',{})
+            cd_s=not lf_s or time.time()-lf_s.get('time',0)>COOLDOWN_M*60
+            dc=state['stats'].get('scalp_today',0)  # daily cap
+            today_key=datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            if today_key!=state['stats'].get('scalp_day'):
+                state['stats']['scalp_today']=0; state['stats']['scalp_day']=today_key
+            if cd_s and state['stats'].get('scalp_today',0)<3:
+                ok_s=send_tg(build_scalp_msg(scalp_sig))
+                if ok_s:
+                    last_fired['XAU_SCALP']={'time':time.time(),'price':scalp_sig['price']}
+                    state['stats']['scalp_today']=state['stats'].get('scalp_today',0)+1
+                    state['stats']['alerts_sent_scalp']=state['stats'].get('alerts_sent_scalp',0)+1
+                    state['open_trades']['XAU_SCALP']={
+                        **scalp_sig,
+                        'sym':'XAU_SCALP','pair':'XAU/USD',
+                        'tp1':scalp_sig['tp_scalp1'],'tp':scalp_sig['tp_scalp2'],
+                        'tp3':scalp_sig['tp_scalp2'],
+                        'time':datetime.now(timezone.utc).isoformat(),
+                        'be_triggered':False,'tp2_hit':False,'tp3_hit':False,
+                        'session_name':sess_info,
+                        'learn_id': log_signal(scalp_sig,{'sym':'XAU','cg':'','kr':''},sess_info),
+                    }
+                    log.info(f"  Scalp TG sent #{state['stats']['scalp_today']}/3 today")
+
+        if not sig: log.info(f"  No main setup (price ${kl[-1]['c']:.2f})"); return
         lf=last_fired.get('XAU',{})
         pm=not lf or abs(sig['price']-lf.get('price',0))/sig['price']>0.003
         cd=not lf or time.time()-lf.get('time',0)>COOLDOWN_M*60
@@ -2364,6 +3536,12 @@ def run_gold_scan():
             log.info(f"  Signal found score={sig['score']} but cooldown/no move")
     except Exception as e:
         log.error(f"Gold scan error: {e}")
+
+    # ── CRYPTO SCALP SCAN (same loop, separate signals) ──────
+    try:
+        run_crypto_scalp_scan()
+    except Exception as e:
+        log.error(f"Crypto scalp scan error: {e}")
 
 def tg_commands():
     lid=[0]
@@ -2413,10 +3591,13 @@ def tg_commands():
                             f"{'⏳ Still collecting data...' if remaining>0 else '✅ Ready to go live! Set PAPER_MODE=false'}\n\n"
                             + performance_report()
                         )
+                    elif txt in ('/scalp','/scalps','/scalpml'):
+                        send_tg(scalp_ml_report())
                     elif txt=='/help':
                         send_tg(
                             "🏅 <b>SMC Gold Commands</b>\n\n"
                             "/stats   — performance\n"
+                            "/scalp   — scalp ML report\n"
                             "/paper   — paper trade status\n"
                             "/learn   — learning report\n"
                             "/deep    — chart analysis\n"
@@ -2463,7 +3644,8 @@ def main():
     def _monitor():
         while True:
             try:
-                if 'XAU' in state['open_trades']: check_gold_prices()
+                check_gold_prices()           # gold TP/SL
+                check_crypto_scalp_prices()   # crypto scalp TP/SL
             except Exception as e: log.debug(f"Monitor: {e}")
             time.sleep(60)
     threading.Thread(target=_monitor,daemon=True).start()
