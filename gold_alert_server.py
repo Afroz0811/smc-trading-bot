@@ -14,7 +14,8 @@ TG_TOKEN   = os.environ.get('TG_TOKEN','')
 TG_CHAT    = os.environ.get('TG_CHAT','')
 PORT       = int(os.environ.get('PORT', 8080))
 SCAN_EVERY = int(os.environ.get('SCAN_EVERY', 1))
-COOLDOWN_M = int(os.environ.get('COOLDOWN_M', 45))
+COOLDOWN_M       = int(os.environ.get('COOLDOWN_M', 60))   # minutes between same-coin signals
+SCALP_COOLDOWN_M = int(os.environ.get('SCALP_COOLDOWN_M', 90))  # scalps need longer cooldown
 GOLD_YF    = 'https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF'
 
 # Crypto pairs for scalp signals
@@ -1764,6 +1765,186 @@ def journal_stats_report():
     except Exception as e:
         return f"Journal error: {e}"
 
+
+# ════════════════════════════════════════════════
+# DATA PERSISTENCE MANAGER
+# ════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
+# DATA PERSISTENCE MANAGER
+# ════════════════════════════════════════════════════════════════
+"""
+Solves the Railway redeploy data loss problem.
+
+Strategy (3 layers):
+  1. Railway Volume (best)  — mount /data, all JSON files live there
+  2. TG file backup         — on startup, if files missing, pull from TG
+  3. TG file backup         — every 6 hours, push latest JSON to TG as file
+
+This means even if Railway volume fails, data is always recoverable
+from your own Telegram chat.
+"""
+
+import base64, zlib
+
+# All data files that must survive redeploys
+DATA_FILES = {
+    'smc_learning':    LEARN_FILE,
+    'smc_deep':        DEEP_LEARN_FILE,
+    'smc_journal':     JOURNAL_FILE,
+}
+
+# Add scalp file if this is the gold server
+try:
+    DATA_FILES['gold_scalp'] = SCALP_LEARN_FILE
+except NameError:
+    pass
+
+def _tg_send_file(filepath, caption):
+    """Send a JSON file to Telegram as document"""
+    if not TG_TOKEN or not TG_CHAT: return False
+    if not Path(filepath).exists(): return False
+    try:
+        with open(filepath, 'rb') as f:
+            data = f.read()
+        fname = Path(filepath).name
+        r = requests.post(
+            f'https://api.telegram.org/bot{TG_TOKEN}/sendDocument',
+            data={'chat_id': TG_CHAT, 'caption': caption},
+            files={'document': (fname, data, 'application/json')},
+            timeout=30
+        )
+        return r.ok
+    except Exception as e:
+        log.debug(f"TG file send error: {e}")
+        return False
+
+def _tg_get_latest_file(filename_pattern):
+    """
+    Get latest backup file from TG.
+    Searches last 100 messages for a document matching the pattern.
+    Returns file content as string, or None.
+    """
+    if not TG_TOKEN or not TG_CHAT: return None
+    try:
+        r = requests.get(
+            f'https://api.telegram.org/bot{TG_TOKEN}/getUpdates',
+            params={'limit': 100, 'timeout': 5},
+            timeout=10
+        )
+        if not r.ok: return None
+        msgs = r.json().get('result', [])
+        # Search in reverse (newest first)
+        for upd in reversed(msgs):
+            msg = upd.get('message', {})
+            doc = msg.get('document', {})
+            if doc.get('file_name', '').startswith(filename_pattern.replace('.json','')):
+                # Download the file
+                file_id = doc['file_id']
+                r2 = requests.get(
+                    f'https://api.telegram.org/bot{TG_TOKEN}/getFile',
+                    params={'file_id': file_id}, timeout=10
+                )
+                if not r2.ok: continue
+                file_path = r2.json()['result']['file_path']
+                r3 = requests.get(
+                    f'https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}',
+                    timeout=15
+                )
+                if r3.ok: return r3.text
+    except Exception as e:
+        log.debug(f"TG file restore error: {e}")
+    return None
+
+def backup_data_to_tg(silent=False):
+    """
+    Backup all learning/journal JSON files to Telegram.
+    Called every 6 hours and on graceful shutdown.
+    """
+    backed_up = []
+    for name, filepath in DATA_FILES.items():
+        if not Path(filepath).exists(): continue
+        try:
+            size = Path(filepath).stat().st_size
+            if size < 10: continue  # skip empty files
+            caption = (
+                f"💾 <b>SMC Data Backup</b> — {name}\n"
+                f"Size: {size:,} bytes\n"
+                f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"
+                f"<i>Auto-restore on next redeploy</i>"
+            )
+            ok = _tg_send_file(filepath, caption)
+            if ok:
+                backed_up.append(name)
+                log.info(f"  💾 Backed up {name} ({size:,} bytes)")
+        except Exception as e:
+            log.debug(f"Backup {name}: {e}")
+
+    if backed_up and not silent:
+        send_tg(
+            f"💾 <b>Data Backup Complete</b>\n\n"
+            f"Backed up: {', '.join(backed_up)}\n"
+            f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n\n"
+            f"<i>Files saved to this chat. Auto-restore on redeploy.</i>"
+        )
+    return backed_up
+
+def restore_data_from_tg():
+    """
+    On startup: check if any data files are missing.
+    If missing, search TG messages for latest backup and restore.
+    Called once at startup before anything else runs.
+    """
+    restored = []; missing = []
+
+    for name, filepath in DATA_FILES.items():
+        if Path(filepath).exists():
+            size = Path(filepath).stat().st_size
+            if size > 10:
+                log.info(f"  ✓ {name}: exists ({size:,} bytes)")
+                continue  # file is fine
+
+        # File missing or empty — try to restore from TG
+        log.info(f"  ⚠ {name}: missing — searching TG for backup...")
+        fname = Path(filepath).name
+        content = _tg_get_latest_file(fname)
+        if content:
+            try:
+                # Validate it's valid JSON
+                parsed = json.loads(content)
+                # Ensure directory exists
+                Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+                with open(filepath, 'w') as f:
+                    json.dump(parsed, f, indent=2)
+                size = len(content)
+                log.info(f"  ✅ Restored {name} from TG ({size:,} bytes)")
+                restored.append(name)
+            except Exception as e:
+                log.warning(f"  ✗ Restore {name} failed: {e}")
+                missing.append(name)
+        else:
+            log.info(f"  ℹ No TG backup found for {name} — starting fresh")
+            missing.append(name)
+
+    return restored, missing
+
+def start_backup_loop():
+    """Background thread: backup every 6 hours"""
+    def _loop():
+        # Wait 10 min before first backup (let server stabilize)
+        time.sleep(600)
+        while True:
+            try:
+                backed = backup_data_to_tg(silent=True)
+                if backed:
+                    log.info(f"Auto-backup: {', '.join(backed)}")
+            except Exception as e:
+                log.debug(f"Auto-backup error: {e}")
+            time.sleep(6 * 3600)  # every 6 hours
+    threading.Thread(target=_loop, daemon=True).start()
+    log.info("✓ Auto-backup loop started (every 6h)")
+
+
+
 def check_circuit_breaker():
     """Pause trading after 3 consecutive losses"""
     try:
@@ -2773,40 +2954,43 @@ def compute_crypto_scalp(kl, pair):
         'is_crypto':  True,
     }
 
-def build_crypto_scalp_msg(sig, count_today, total_today):
-    """Crypto scalp TG message"""
-    ib  = sig['dir'] == 'BUY'
-    e   = sig['entry']
-    risk = abs(e-sig['sl'])
-    tp1d = round(abs(sig['tp1']-e), 6)
-    tp2d = round(abs(sig['tp']-e), 6)
-    tp1p = round(tp1d/e*100, 2)
-    tp2p = round(tp2d/e*100, 2)
+def build_crypto_scalp_msg(sig, count_today):
+    """Crypto scalp TG message — clearly labelled SCALP with full TP/SL"""
+    ib   = sig['dir'] == 'BUY'
+    e    = sig['entry']
+    sl   = sig['sl']
+    tp1  = sig['tp1']
+    tp2  = sig['tp']
+    tp3  = sig['tp3']
+    risk = abs(e - sl)
+    tp1p = round(abs(tp1-e)/e*100, 2)
+    tp2p = round(abs(tp2-e)/e*100, 2)
+    tp3p = round(abs(tp3-e)/e*100, 2)
+    slp  = round(abs(sl-e)/e*100, 2)
     em   = '⚡' if sig['setup']=='SWEEP_OB' else '🔄'
-
     return '\n'.join(filter(None, [
-        f"{'🟢' if ib else '🔴'} <b>CRYPTO SCALP {'BUY' if ib else 'SELL'} — {sig['sym']}/USD</b>",
-        f"{em} {sig['setup_name']}  |  Score: {sig['score']}/10  |  ML: {sig['ml_conf']:.0f}%",
-        f"📅 Signal {count_today}/{CRYPTO_SCALP_DAILY_CAP} today  |  Session: {sig['session']}",
+        f"{'🟢' if ib else '🔴'} <b>⚡ SCALP {'BUY' if ib else 'SELL'} — {sig['sym']}/USD</b>  <code>[SCALP #{count_today}/{CRYPTO_SCALP_DAILY_CAP}]</code>",
+        f"{em} <b>{sig.get('setup_name','Scalp Setup')}</b>  |  Score: {sig['score']}/10  |  ML: {sig.get('ml_conf',0):.0f}%",
+        f"📅 Session: {sig.get('session','—')}  |  RSI: {sig.get('rsi_val','—')}  |  Weekly: {sig.get('weekly','—')}",
         "",
         "💰 <b>Scalp Levels</b>",
         f"  Entry:  <code>{fp_crypto(e)}</code>",
-        f"  SL:     <code>{fp_crypto(sig['sl'])}</code>  <i>(-{sig['risk_pct']}%) — below wick</i>",
-        f"  TP1:    <code>{fp_crypto(sig['tp1'])}</code>  <i>(+{tp1p}% — 1:1.5 — close 70%)</i>",
-        f"  TP2:    <code>{fp_crypto(sig['tp'])}</code>   <i>(+{tp2p}% — 1:2.0 — runner 30%)</i>",
-        f"  TP3:    <code>{fp_crypto(sig['tp3'])}</code>  <i>(1:2.5 — let go)</i>",
+        f"  SL:     <code>{fp_crypto(sl)}</code>  <i>(-{slp}% — below wick)</i>",
+        f"  TP1:    <code>{fp_crypto(tp1)}</code>  <i>(+{tp1p}% — 1:1.5 — close 70%)</i>",
+        f"  TP2:    <code>{fp_crypto(tp2)}</code>  <i>(+{tp2p}% — 1:2.0 — runner 30%)</i>",
+        f"  TP3:    <code>{fp_crypto(tp3)}</code>  <i>(+{tp3p}% — 1:2.5 — let go)</i>",
         "",
-        "📖 <b>Why this scalp:</b>",
-        sig['why'],
+        f"📖 <b>Why this scalp:</b>",
+        sig.get('why', '  SMC confluence setup'),
         "",
-        f"🔍 {esc(' · '.join(sig['tags']))}",
-        f"Weekly: {sig['weekly']}  |  RSI: {sig['rsi_val']}",
-        sig['ob'] and f"OB: {fp_crypto(sig['ob']['bot'])} – {fp_crypto(sig['ob']['top'])}",
+        f"🔍 {esc(' · '.join(sig.get('tags',[])))}" if sig.get('tags') else None,
+        sig.get('ob') and f"  OB: {fp_crypto(sig['ob']['bot'])} – {fp_crypto(sig['ob']['top'])}",
+        sig.get('wick_sl') and f"  Swept at: {fp_crypto(sig['wick_sl'])}",
         "",
-        f"⚡ <i>Scalp — aim for TP1 first. Move SL to entry at TP1.</i>",
-        f"⚠️ <i>Exit at session close if TP not hit.</i>",
+        "⚡ <i>SCALP — aim TP1 first. Move SL to entry at TP1. Exit at session close if not hit.</i>",
         f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC  |  📡 <b>SMC Crypto Scalp</b>",
     ]))
+
 
 def run_crypto_scalp_scan():
     """
@@ -2823,6 +3007,13 @@ def run_crypto_scalp_scan():
     if today != state.get('scalp_crypto_day'):
         state['scalp_crypto_day']   = today
         state['scalp_crypto_count'] = {}  # {sym: count}
+        state['scalp_crypto_total'] = 0   # total across all coins today
+
+    # Global daily cap: max 6 crypto scalps per day across ALL coins
+    GLOBAL_DAILY_CAP = int(os.environ.get('CRYPTO_SCALP_GLOBAL_CAP', 6))
+    if state.get('scalp_crypto_total', 0) >= GLOBAL_DAILY_CAP:
+        log.debug(f"Global scalp cap hit ({GLOBAL_DAILY_CAP}/day) — skip crypto scan")
+        return
 
     signals_sent = 0
     for pair in CRYPTO_PAIRS:
@@ -2832,7 +3023,7 @@ def run_crypto_scalp_scan():
             continue
         # Cooldown: don't fire same coin twice within COOLDOWN_M
         lf = last_fired.get(f'SCALP_{sym}', {})
-        if lf and time.time()-lf.get('time',0) < COOLDOWN_M*60:
+        if lf and time.time()-lf.get('time',0) < SCALP_COOLDOWN_M*60:
             continue
         # Skip if already in open trade for this coin
         if f'SCALP_{sym}' in state['open_trades']:
@@ -2850,7 +3041,7 @@ def run_crypto_scalp_scan():
                 continue
             count = state['scalp_crypto_count'].get(sym, 0) + 1
             total = sum(state['scalp_crypto_count'].values()) + 1
-            msg = build_crypto_scalp_msg(sig, count, total)
+            msg = build_crypto_scalp_msg(sig, count)
             ok  = send_tg(msg)
             if ok:
                 last_fired[f'SCALP_{sym}'] = {'time':time.time(),'price':sig['price']}
@@ -3593,10 +3784,13 @@ def tg_commands():
                         )
                     elif txt in ('/scalp','/scalps','/scalpml'):
                         send_tg(scalp_ml_report())
+                    elif txt in ('/backup','/save'):
+                        backed=backup_data_to_tg()
                     elif txt=='/help':
                         send_tg(
                             "🏅 <b>SMC Gold Commands</b>\n\n"
                             "/stats   — performance\n"
+                            "/backup  — backup data to TG\n"
                             "/scalp   — scalp ML report\n"
                             "/paper   — paper trade status\n"
                             "/learn   — learning report\n"
@@ -3613,6 +3807,17 @@ def main():
     if not TG_TOKEN or not TG_CHAT:
         log.error("Need TG_TOKEN + TG_CHAT env vars"); raise SystemExit(1)
     log.info("="*55)
+    # ── Restore data from TG backup if files missing ────────────
+    log.info("Checking data files...")
+    restored, missing = restore_data_from_tg()
+    if restored:
+        send_tg(
+            f"✅ <b>Data Restored from Backup</b>\n\n"
+            f"Restored: {', '.join(restored)}\n"
+            f"<i>Previous learning data recovered!</i>"
+        )
+    elif missing:
+        log.info(f"Starting fresh for: {', '.join(missing)}")
     log.info("SMC GOLD ENGINE v1 — 24/7 SELF-LEARNING")
     log.info(f"Mode: {'SCALP' if SCALP_MODE else 'SWING'} | SL max: {MAX_SL_PCT*100}% | "
              f"TP1:1:{TP1_MULT} TP2:1:{TP2_MULT} TP3:1:{TP3_MULT}")
