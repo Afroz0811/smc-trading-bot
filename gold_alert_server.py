@@ -2999,9 +2999,10 @@ def run_crypto_scalp_scan():
     Max 3 scalps/coin/day.
     Tracks each in open_trades['SCALP_BTC'] etc.
     """
-    if not is_scalp_session():
-        log.debug("Crypto scalp: not in session — skip")
-        return
+    # No hard session block — ML handles session weighting
+    # is_scalp_session() result passed to ML for score adjustment
+    current_session = get_gold_session()
+    log.debug(f"Crypto scalp scan — session: {current_session}")
 
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     if today != state.get('scalp_crypto_day'):
@@ -3036,8 +3037,11 @@ def run_crypto_scalp_scan():
             if not sig:
                 log.debug(f"  {sym}: no scalp setup"); continue
             # ML confidence gate
-            if sig['ml_conf'] < 65:
-                log.debug(f"  {sym}: low ML conf {sig['ml_conf']:.0f}% — skip")
+            # ML conf gate — threshold lower for active sessions, higher for weak ones
+            sess_now = get_gold_session()
+            ml_threshold = 60 if sess_now in ('London', 'New York') else 72
+            if sig['ml_conf'] < ml_threshold:
+                log.debug(f"  {sym}: low ML conf {sig['ml_conf']:.0f}% < {ml_threshold} ({sess_now}) — skip")
                 continue
             count = state['scalp_crypto_count'].get(sym, 0) + 1
             total = sum(state['scalp_crypto_count'].values()) + 1
