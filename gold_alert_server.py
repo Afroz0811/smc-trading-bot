@@ -881,7 +881,6 @@ def journal_stats_report():
 # ═══ DATA PERSISTENCE ════════════════════════════════════════════
 import base64, zlib
 
-<<<<<<< HEAD
 def get_data_files():
     files = {
         'smc_learning': os.environ.get('LEARN_FILE',      '/app/gold_learning.json'),
@@ -889,17 +888,6 @@ def get_data_files():
         'smc_journal':  os.environ.get('JOURNAL_FILE',    '/app/gold_journal.json'),
     }
     scalp = os.environ.get('SCALP_LEARN_FILE', '/app/gold_scalp_ml.json')
-=======
-# All data files that must survive redeploys
-def get_data_files():
-    """Build data files dict at runtime — all vars guaranteed defined by then"""
-    files = {
-        'smc_learning': os.environ.get('LEARN_FILE',      '/data/smc_learning.json'),
-        'smc_deep':     os.environ.get('DEEP_LEARN_FILE', '/data/smc_deep_learning.json'),
-        'smc_journal':  os.environ.get('JOURNAL_FILE',    '/data/smc_journal.json'),
-    }
-    scalp = os.environ.get('SCALP_LEARN_FILE', '/data/gold_scalp_ml.json')
->>>>>>> d6b4f602b0e5ed08cf8c4f22c86398bcb286e865
     if scalp:
         files['gold_scalp'] = scalp
     return files
@@ -980,10 +968,6 @@ def backup_data_to_tg(silent=False):
 
 def restore_data_from_tg():
     restored = []; missing = []
-<<<<<<< HEAD
-=======
-
->>>>>>> d6b4f602b0e5ed08cf8c4f22c86398bcb286e865
     for name, filepath in get_data_files().items():
         if Path(filepath).exists():
             size = Path(filepath).stat().st_size
@@ -1390,384 +1374,6 @@ def gold_chop(atr_a, i, thresh=0.25):
     FIX: threshold lowered from 0.40 to 0.25.
     Gold at ATH has smaller ATR relative to avg — 0.40 was too aggressive.
     """
-<<<<<<< HEAD
-=======
-    if not kl or len(kl) < 60: return None
-    n = len(kl); i = n-1
-    closes = [k['c'] for k in kl]; vols = [k['v'] for k in kl]
-    ri_a  = rsi(closes);    e9_a  = ema(closes, 9)
-    e20_a = ema(closes, 20); e50_a = ema(closes, 50)
-    ht_a  = macd_hist(closes); at_a = calc_atr(kl); va_a = vol_avg(vols)
-
-    if not all([ri_a[i],e9_a[i],e20_a[i],e50_a[i],at_a[i],va_a[i]]): return None
-
-    price = closes[i]; k = kl[i]
-    at = float(at_a[i]); va = float(va_a[i])
-    ri_v = float(ri_a[i]); e9 = float(e9_a[i])
-    e20  = float(e20_a[i]); e50 = float(e50_a[i]); ht = ht_a[i]
-
-    # Chop filter
-    r_ = [x for x in at_a[max(0,i-20):i] if x]
-    if not r_ or at < sum(r_)/len(r_)*0.40: return None
-
-    sh_, sl_ = swings(kl[:i+1], 5)
-    weekly = htf_bias_fn(kl, i, 21)
-    daily  = htf_bias_fn(kl, i, 5)
-
-    is_buy = None; score = 0.0; tags = []; setup = None; wick_sl = None; ob_hit = None
-
-    # ── SETUP 1: Sweep + OB (priority — best scalp setup) ────────
-    for li, lvl in [(ix,float(p)) for ix,p in sl_ if ix<i-1 and ix>i-50][-4:]:
-        if not(k['l']<lvl<price) or lvl-k['l']<at*0.25 or k['v']<va*1.1: continue
-        if daily != 'bullish' or weekly == 'bearish': continue
-        if not(25<ri_v<65): continue
-        # Anti-trend: skip if 5/6 recent candles are red
-        r6 = kl[max(0,i-6):i+1]
-        if sum(1 for x in r6 if x['c']<x['o']) >= 5: continue
-        ob = None
-        for j in range(li-1, max(0,li-12), -1):
-            if kl[j]['c']<kl[j]['o'] and (kl[min(j+2,n-1)]['c']-kl[j]['c'])/kl[j]['c']>0.003:
-                ob={'top':kl[j]['o'],'bot':kl[j]['l']}; break
-        if not ob or not(ob['bot']<=price<=ob['top']*1.005): continue
-        is_buy=True; setup='SWEEP_OB'; score+=3.5
-        tags+=['Sweep↑','OB_Retest']; wick_sl=k['l']; ob_hit=ob; break
-
-    for hi_, lvl in [(ix,float(p)) for ix,p in sh_ if ix<i-1 and ix>i-50][-4:]:
-        if not(k['h']>lvl>price) or k['h']-lvl<at*0.25 or k['v']<va*1.1: continue
-        if daily != 'bearish' or weekly == 'bullish': continue
-        if not(35<ri_v<75): continue
-        r6 = kl[max(0,i-6):i+1]
-        if sum(1 for x in r6 if x['c']>x['o']) >= 5: continue
-        ob = None
-        for j in range(hi_-1, max(0,hi_-12), -1):
-            if kl[j]['c']>kl[j]['o'] and (kl[min(j+2,n-1)]['c']-kl[j]['c'])/kl[j]['c']<-0.003:
-                ob={'top':kl[j]['h'],'bot':kl[j]['c']}; break
-        if not ob or not(ob['bot']*0.995<=price<=ob['top']): continue
-        is_buy=False; setup='SWEEP_OB'; score+=3.5
-        tags+=['Sweep↓','OB_Retest']; wick_sl=k['h']; ob_hit=ob; break
-
-    # ── SETUP 2: CHoCH Reversal ────────────────────────────────
-    if is_buy is None:
-        rh = [(ix,float(p)) for ix,p in sh_ if ix<=i][-5:]
-        rl = [(ix,float(p)) for ix,p in sl_ if ix<=i][-5:]
-        if len(rh)>=3 and len(rl)>=3:
-            h2,h1p = rh[-2][1],rh[-3][1]; l2,l1p = rl[-2][1],rl[-3][1]
-            vok = k['v'] > va*1.05
-            if abs(h2-h1p)/max(h1p,1)>=0.003 and abs(l2-l1p)/max(l1p,1)>=0.003:
-                if h2<h1p and l2<l1p and price>h2 and ht and ht>0 and 28<ri_v<62 and vok and weekly!='bearish':
-                    is_buy=True; setup='CHOCH'; score+=3.5; tags+=['CHoCH↑']
-                elif h2>h1p and l2>l1p and price<l2 and ht and ht<0 and 38<ri_v<72 and vok and weekly!='bullish':
-                    is_buy=False; setup='CHOCH'; score+=3.5; tags+=['CHoCH↓']
-
-    if is_buy is None: return None
-
-    # ── CONFLUENCES ────────────────────────────────────────────
-    if k['v']>va*1.6:   score+=1.0; tags.append('Vol++')
-    elif k['v']>va*1.2: score+=0.5; tags.append('Vol✓')
-    if is_buy  and price>e20>e50: score+=1.0; tags.append('EMA↑')
-    elif not is_buy and price<e20<e50: score+=1.0; tags.append('EMA↓')
-    if ht:
-        if is_buy  and ht>0: score+=0.5; tags.append('MACD+')
-        elif not is_buy and ht<0: score+=0.5; tags.append('MACD-')
-    if is_buy  and ri_v<35: score+=1.0; tags.append(f'RSI{round(ri_v)}')
-    elif is_buy  and ri_v<50: score+=0.5; tags.append(f'RSI{round(ri_v)}')
-    elif not is_buy and ri_v>65: score+=1.0; tags.append(f'RSI{round(ri_v)}')
-    elif not is_buy and ri_v>50: score+=0.5; tags.append(f'RSI{round(ri_v)}')
-    if is_buy  and weekly=='bullish': score+=0.5; tags.append('W:Bull')
-    elif not is_buy and weekly=='bearish': score+=0.5; tags.append('W:Bear')
-    elif (is_buy and weekly=='bearish') or (not is_buy and weekly=='bullish'): score-=1.5
-    if is_buy  and daily=='bullish': score+=0.5; tags.append('D:Bull')
-    elif not is_buy and daily=='bearish': score+=0.5; tags.append('D:Bear')
-    # RSI divergence booster
-    lb=12
-    rl_div=[(ix,float(p)) for ix,p in sl_ if i-lb<ix<i][-3:]
-    if is_buy and len(rl_div)>=2 and ri_a[rl_div[-2][0]] and ri_a[rl_div[-1][0]]:
-        if rl_div[-1][1]<rl_div[-2][1] and ri_a[rl_div[-1][0]]>ri_a[rl_div[-2][0]]:
-            score+=1.5; tags.append('RSI_Div✓')
-
-    score = round(max(0, min(10, score)), 1)
-    if score < CRYPTO_SCALP_MIN_SCORE: return None
-
-    # ── SL: wick-based (tight) ────────────────────────────────
-    if wick_sl is not None:
-        sl_p = wick_sl - at*0.08 if is_buy else wick_sl + at*0.08
-    else:
-        rl2 = [(ix,float(p)) for ix,p in sl_ if ix<=i][-2:]
-        rh2 = [(ix,float(p)) for ix,p in sh_ if ix<=i][-2:]
-        sl_p = (min(p for _,p in rl2)-at*0.08) if (is_buy and rl2) else \
-               (max(p for _,p in rh2)+at*0.08) if (not is_buy and rh2) else \
-               (price-at*1.5 if is_buy else price+at*1.5)
-
-    # Max SL cap
-    if is_buy  and (price-sl_p)>price*CRYPTO_SCALP_MAX_SL: sl_p=price-price*CRYPTO_SCALP_MAX_SL
-    if not is_buy and (sl_p-price)>price*CRYPTO_SCALP_MAX_SL: sl_p=price+price*CRYPTO_SCALP_MAX_SL
-    risk = abs(price-sl_p)
-    if risk <= 0 or risk < price*0.001: return None
-
-    tp1  = price+risk*CRYPTO_SCALP_TP1 if is_buy else price-risk*CRYPTO_SCALP_TP1
-    tp2  = price+risk*CRYPTO_SCALP_TP2 if is_buy else price-risk*CRYPTO_SCALP_TP2
-    tp3  = price+risk*2.5 if is_buy else price-risk*2.5  # runner
-    if abs(tp2-price)/risk < 1.8: return None
-
-    # Apply ML adjusted score
-    sess = get_gold_session()
-    sig_tmp = {'dir':'BUY' if is_buy else 'SELL','score':score,'tags':tags,
-               'rsi_val':round(ri_v,1),'weekly':weekly,'session':sess}
-    ml_conf = scalp_adjusted_score(sig_tmp, sess)
-
-    setup_names = {
-        'SWEEP_OB': '⚡ Sweep+OB Retest',
-        'CHOCH':    '🔄 CHoCH Reversal',
-    }
-    why_map = {
-        'SWEEP_OB': (f"  1️⃣ Retail stops swept at {fp_crypto(wick_sl)}\n"
-                     f"  2️⃣ Closed back above — stop hunt done\n"
-                     f"  3️⃣ OB zone: {fp_crypto(ob_hit['bot'])} – {fp_crypto(ob_hit['top'])}\n" if ob_hit else
-                     "  Sweep+OB retest\n")+
-                    f"  4️⃣ SL below wick — tight risk\n"
-                    f"  💡 Scalp: target TP1 fast, trail to TP2",
-        'CHOCH':    (f"  1️⃣ {'Downtrend' if is_buy else 'Uptrend'} → structure shifted\n"
-                     f"  2️⃣ CHoCH confirmed — {'bullish' if is_buy else 'bearish'} direction\n"
-                     f"  3️⃣ Volume surge + MACD confirmed\n"
-                     f"  💡 Scalp: SL at swing, quick TP1"),
-    }
-
-    return {
-        'sym':        pair['sym'],
-        'name':       pair['sym'],
-        'pair':       f"{pair['sym']}/USD",
-        'dir':        'BUY' if is_buy else 'SELL',
-        'setup':      setup,
-        'setup_name': setup_names.get(setup, setup),
-        'why':        why_map.get(setup, ''),
-        'score':      score,
-        'ml_conf':    ml_conf,
-        'conf':       min(96, round(score*8+min(CRYPTO_SCALP_TP2,3)*2.5)),
-        'rr':         CRYPTO_SCALP_TP2,
-        'price':      price,
-        'entry':      price,
-        'sl':         round(sl_p, 6),
-        'tp1':        round(tp1, 6),
-        'tp':         round(tp2, 6),
-        'tp3':        round(tp3, 6),
-        'risk_pct':   round(risk/price*100, 3),
-        'rew_pct':    round(abs(tp2-price)/price*100, 3),
-        'sl_dollar':  None,
-        'tp1_dollar': None,
-        'tp2_dollar': None,
-        'tags':       tags,
-        'weekly':     weekly,
-        'daily':      daily,
-        'session':    sess,
-        'ob':         ob_hit,
-        'wick_sl':    round(wick_sl, 6) if wick_sl else None,
-        'rsi_val':    round(ri_v, 1),
-        'is_crypto':  True,
-    }
-
-def build_crypto_scalp_msg(sig, count_today):
-    """Crypto scalp TG message — clearly labelled SCALP with full TP/SL"""
-    ib   = sig['dir'] == 'BUY'
-    e    = sig['entry']
-    sl   = sig['sl']
-    tp1  = sig['tp1']
-    tp2  = sig['tp']
-    tp3  = sig['tp3']
-    risk = abs(e - sl)
-    tp1p = round(abs(tp1-e)/e*100, 2)
-    tp2p = round(abs(tp2-e)/e*100, 2)
-    tp3p = round(abs(tp3-e)/e*100, 2)
-    slp  = round(abs(sl-e)/e*100, 2)
-    em   = '⚡' if sig['setup']=='SWEEP_OB' else '🔄'
-    return '\n'.join(filter(None, [
-        f"{'🟢' if ib else '🔴'} <b>⚡ SCALP {'BUY' if ib else 'SELL'} — {sig['sym']}/USD</b>  <code>[SCALP #{count_today}/{CRYPTO_SCALP_DAILY_CAP}]</code>",
-        f"{em} <b>{sig.get('setup_name','Scalp Setup')}</b>  |  Score: {sig['score']}/10  |  ML: {sig.get('ml_conf',0):.0f}%",
-        f"📅 Session: {sig.get('session','—')}  |  RSI: {sig.get('rsi_val','—')}  |  Weekly: {sig.get('weekly','—')}",
-        "",
-        "💰 <b>Scalp Levels</b>",
-        f"  Entry:  <code>{fp_crypto(e)}</code>",
-        f"  SL:     <code>{fp_crypto(sl)}</code>  <i>(-{slp}% — below wick)</i>",
-        f"  TP1:    <code>{fp_crypto(tp1)}</code>  <i>(+{tp1p}% — 1:1.5 — close 70%)</i>",
-        f"  TP2:    <code>{fp_crypto(tp2)}</code>  <i>(+{tp2p}% — 1:2.0 — runner 30%)</i>",
-        f"  TP3:    <code>{fp_crypto(tp3)}</code>  <i>(+{tp3p}% — 1:2.5 — let go)</i>",
-        "",
-        f"📖 <b>Why this scalp:</b>",
-        sig.get('why', '  SMC confluence setup'),
-        "",
-        f"🔍 {esc(' · '.join(sig.get('tags',[])))}" if sig.get('tags') else None,
-        sig.get('ob') and f"  OB: {fp_crypto(sig['ob']['bot'])} – {fp_crypto(sig['ob']['top'])}",
-        sig.get('wick_sl') and f"  Swept at: {fp_crypto(sig['wick_sl'])}",
-        "",
-        "⚡ <i>SCALP — aim TP1 first. Move SL to entry at TP1. Exit at session close if not hit.</i>",
-        f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC  |  📡 <b>SMC Crypto Scalp</b>",
-    ]))
-
-
-def run_crypto_scalp_scan():
-    """
-    Scan all 10 crypto pairs for scalp signals.
-    Only fires during London/NY session.
-    Max 3 scalps/coin/day.
-    Tracks each in open_trades['SCALP_BTC'] etc.
-    """
-    # No hard session block — ML handles session weighting
-    # is_scalp_session() result passed to ML for score adjustment
-    current_session = get_gold_session()
-    log.debug(f"Crypto scalp scan — session: {current_session}")
-
-    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    if today != state.get('scalp_crypto_day'):
-        state['scalp_crypto_day']   = today
-        state['scalp_crypto_count'] = {}  # {sym: count}
-        state['scalp_crypto_total'] = 0   # total across all coins today
-
-    # Global daily cap: max 6 crypto scalps per day across ALL coins
-    GLOBAL_DAILY_CAP = int(os.environ.get('CRYPTO_SCALP_GLOBAL_CAP', 6))
-    if state.get('scalp_crypto_total', 0) >= GLOBAL_DAILY_CAP:
-        log.debug(f"Global scalp cap hit ({GLOBAL_DAILY_CAP}/day) — skip crypto scan")
-        return
-
-    signals_sent = 0
-    for pair in CRYPTO_PAIRS:
-        sym = pair['sym']
-        # Daily cap check
-        if state['scalp_crypto_count'].get(sym, 0) >= CRYPTO_SCALP_DAILY_CAP:
-            continue
-        # Cooldown: don't fire same coin twice within COOLDOWN_M
-        lf = last_fired.get(f'SCALP_{sym}', {})
-        if lf and time.time()-lf.get('time',0) < SCALP_COOLDOWN_M*60:
-            continue
-        # Skip if already in open trade for this coin
-        if f'SCALP_{sym}' in state['open_trades']:
-            continue
-        try:
-            kl = fetch_crypto_candles(pair, limit=200)
-            if not kl or len(kl)<60:
-                log.debug(f"  Crypto scalp {sym}: no data"); continue
-            sig = compute_crypto_scalp(kl, pair)
-            if not sig:
-                log.debug(f"  {sym}: no scalp setup"); continue
-            # ML confidence gate
-            # ML conf gate — threshold lower for active sessions, higher for weak ones
-            sess_now = get_gold_session()
-            ml_threshold = 60 if sess_now in ('London', 'New York') else 72
-            if sig['ml_conf'] < ml_threshold:
-                log.debug(f"  {sym}: low ML conf {sig['ml_conf']:.0f}% < {ml_threshold} ({sess_now}) — skip")
-                continue
-            count = state['scalp_crypto_count'].get(sym, 0) + 1
-            total = sum(state['scalp_crypto_count'].values()) + 1
-            msg = build_crypto_scalp_msg(sig, count)
-            ok  = send_tg(msg)
-            if ok:
-                last_fired[f'SCALP_{sym}'] = {'time':time.time(),'price':sig['price']}
-                state['scalp_crypto_count'][sym] = count
-                state['alerts_sent'] = state.get('alerts_sent', 0) + 1
-                sess = get_gold_session()
-                lid  = log_signal(sig, pair, sess)
-                state['open_trades'][f'SCALP_{sym}'] = {
-                    **sig,
-                    'sym':          f'SCALP_{sym}',
-                    'real_sym':     sym,
-                    'pair_obj':     pair,
-                    'time':         datetime.now(timezone.utc).isoformat(),
-                    'be_triggered': False,
-                    'tp2_hit':      False,
-                    'session_name': sess,
-                    'learn_id':     lid,
-                }
-                signals_sent += 1
-                log.info(f"  Scalp {sym}: {sig['setup']} {sig['dir']} score={sig['score']} mlconf={sig['ml_conf']:.0f}% → TG ✓")
-        except Exception as e:
-            log.error(f"  Crypto scalp {sym} error: {e}")
-        time.sleep(0.5)
-
-    if signals_sent:
-        log.info(f"Crypto scalp scan: {signals_sent} signals sent")
-
-def check_crypto_scalp_prices():
-    """Monitor open crypto scalp trades for TP/SL hits"""
-    for trade_key in list(state['open_trades'].keys()):
-        if not trade_key.startswith('SCALP_'): continue
-        trade = state['open_trades'][trade_key]
-        real_sym = trade.get('real_sym', trade_key.replace('SCALP_',''))
-        pair_obj = trade.get('pair_obj')
-        if not pair_obj: continue
-        price = fetch_crypto_price(pair_obj)
-        if not price: continue
-        ib = trade['dir']=='BUY'; en = trade['entry']
-        sl_p=trade['sl']; tp1_p=trade['tp1']; tp2_p=trade['tp']; tp3_p=trade.get('tp3',tp2_p)
-
-        # TP1 — breakeven
-        if not trade.get('be_triggered'):
-            if (ib and price>=tp1_p) or (not ib and price<=tp1_p):
-                trade['be_triggered']=True
-                pnl1=round(abs(tp1_p-en)/en*100,3)
-                send_tg(
-                    f"🎯 <b>SCALP TP1 HIT — {real_sym}/USD +{pnl1}%</b>\n\n"
-                    f"Close 70% at <code>{fp_crypto(price)}</code>\n"
-                    f"Move SL to entry: <code>{fp_crypto(en)}</code>\n"
-                    f"Runner → TP2: <code>{fp_crypto(tp2_p)}</code>\n"
-                    f"Scalp now risk-free!  |  📡 SMC Crypto Scalp"
-                )
-
-        # TP2 — WIN
-        if not trade.get('tp2_hit'):
-            if (ib and price>=tp2_p) or (not ib and price<=tp2_p):
-                trade['tp2_hit']=True
-                pnl=round(abs(tp2_p-en)/en*100,3)
-                send_tg(
-                    f"✅ <b>SCALP WIN — {real_sym}/USD +{pnl}%</b>\n\n"
-                    f"{trade.get('setup_name','—')}\n"
-                    f"Entry {fp_crypto(en)} → Exit {fp_crypto(price)}\n"
-                    f"Held: {_hours_held(trade)}\n\n"
-                    f"🤖 ML learning from this win...\n"
-                    f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC  |  📡 SMC Crypto Scalp"
-                )
-                scalp_record_trade(trade, trade.get('session_name','Unknown'), 'win', pnl)
-                lid=trade.get('learn_id')
-                if lid: close_trade(lid,'win',price)
-                journal_close_trade(real_sym,'win',price)
-                state['stats']['wins']=state['stats'].get('wins',0)+1
-                del state['open_trades'][trade_key]; continue
-
-        # TP3 — Runner
-        if trade.get('tp2_hit') and not trade.get('tp3_hit'):
-            if (ib and price>=tp3_p) or (not ib and price<=tp3_p):
-                trade['tp3_hit']=True; pnl=round(abs(tp3_p-en)/en*100,3)
-                send_tg(f"🚀 <b>SCALP RUNNER — {real_sym}/USD +{pnl}%</b>\nFull exit.  📡 SMC Crypto Scalp")
-                continue
-
-        # SL — LOSS
-        if (ib and price<=sl_p) or (not ib and price>=sl_p):
-            pnl=round(abs(sl_p-en)/en*100,3)
-            tags=trade.get('tags',[]); rsi_v=trade.get('rsi_val',50); weekly=trade.get('weekly','neutral')
-            why=[]
-            if trade['dir']=='BUY' and weekly=='bearish': why.append("BUY vs weekly bearish")
-            if trade['dir']=='SELL' and weekly=='bullish': why.append("SELL vs weekly bullish")
-            if trade['dir']=='BUY' and rsi_v>62: why.append(f"RSI {rsi_v} overbought")
-            if trade['dir']=='SELL' and rsi_v<38: why.append(f"RSI {rsi_v} oversold")
-            if abs(price-en)/en*100<0.2: why.append("Stopped immediately — news/entry timing")
-            reason = '\n'.join(f"  ⚠️ {r}" for r in why) if why else "  Market moved against setup"
-            send_tg(
-                f"❌ <b>SCALP LOSS — {real_sym}/USD -{pnl}%</b>\n\n"
-                f"{trade.get('setup_name','—')}  Score: {trade.get('score',0)}/10\n"
-                f"Entry {fp_crypto(en)} → SL {fp_crypto(price)}\n"
-                f"Held: {_hours_held(trade)}\n\n"
-                f"🔍 <b>Why failed:</b>\n{reason}\n\n"
-                f"🤖 Adjusting ML weights...\n"
-                f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC  |  📡 SMC Crypto Scalp"
-            )
-            scalp_record_trade(trade, trade.get('session_name','Unknown'), 'loss', -pnl)
-            lid=trade.get('learn_id')
-            if lid: close_trade(lid,'loss',price)
-            journal_close_trade(real_sym,'loss',price)
-            state['stats']['losses']=state['stats'].get('losses',0)+1
-            del state['open_trades'][trade_key]
-
-# ════════════════════════════════════════════════════════════
-
-def gold_chop(atr_a, i, thresh=0.40):
->>>>>>> d6b4f602b0e5ed08cf8c4f22c86398bcb286e865
     r=[x for x in atr_a[max(0,i-20):i] if x]
     if not r: return True
     avg_atr = sum(r)/len(r)
@@ -2617,30 +2223,18 @@ def check_gold_prices():
 
 # ═══ MAIN SCAN ═══════════════════════════════════════════════════
 def run_gold_scan():
-    """Gold XAU/USD scan — only runs when gold market is open"""
     state['scans_done']+=1
     state['last_scan']=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
-<<<<<<< HEAD
     # Crypto runs every scan, no session restriction
-=======
-    # ── Crypto scalp scan runs 24/7 REGARDLESS of gold hours ──
->>>>>>> d6b4f602b0e5ed08cf8c4f22c86398bcb286e865
     try:
         run_crypto_scalp_scan()
     except Exception as e:
         log.error(f"Crypto scalp scan error: {e}")
 
-<<<<<<< HEAD
     is_open, sess_info = gold_market_open()
     if not is_open:
         log.info(f"Gold market: {sess_info}")
-=======
-    # ── Gold market hours check ────────────────────────────────
-    is_open, sess_info = gold_market_open()
-    if not is_open:
-        log.info(f"Gold market closed: {sess_info} — crypto only scan done")
->>>>>>> d6b4f602b0e5ed08cf8c4f22c86398bcb286e865
         return
 
     log.info(f"Gold scan #{state['scans_done']} — Session: {sess_info}")
@@ -2732,7 +2326,6 @@ def run_gold_scan():
     except Exception as e:
         log.error(f"Gold scan error: {e}")
 
-<<<<<<< HEAD
 # ═══ HEALTH SERVER ════════════════════════════════════════════════
 class Health(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -2760,9 +2353,6 @@ class Health(BaseHTTPRequestHandler):
         self.send_header('Content-Length',str(len(body))); self.end_headers()
         self.wfile.write(body)
     def log_message(self,*a): pass
-=======
-    # Crypto scalp scan already called at top of run_gold_scan
->>>>>>> d6b4f602b0e5ed08cf8c4f22c86398bcb286e865
 
 # ═══ TG COMMANDS ═════════════════════════════════════════════════
 def tg_commands():
