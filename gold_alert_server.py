@@ -3628,13 +3628,20 @@ class Health(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 
 def run_gold_scan():
+    """Gold XAU/USD scan — only runs when gold market is open"""
     state['scans_done']+=1
     state['last_scan']=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
-    # ── Market hours check ─────────────────────────────────────
+    # ── Crypto scalp scan runs 24/7 REGARDLESS of gold hours ──
+    try:
+        run_crypto_scalp_scan()
+    except Exception as e:
+        log.error(f"Crypto scalp scan error: {e}")
+
+    # ── Gold market hours check ────────────────────────────────
     is_open, sess_info = gold_market_open()
     if not is_open:
-        log.info(f"Gold market closed: {sess_info} — skipping scan")
+        log.info(f"Gold market closed: {sess_info} — crypto only scan done")
         return
 
     log.info(f"Gold scan #{state['scans_done']} — Session: {sess_info}")
@@ -3732,11 +3739,7 @@ def run_gold_scan():
     except Exception as e:
         log.error(f"Gold scan error: {e}")
 
-    # ── CRYPTO SCALP SCAN (same loop, separate signals) ──────
-    try:
-        run_crypto_scalp_scan()
-    except Exception as e:
-        log.error(f"Crypto scalp scan error: {e}")
+    # Crypto scalp scan already called at top of run_gold_scan
 
 def tg_commands():
     lid=[0]
