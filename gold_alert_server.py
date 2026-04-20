@@ -1512,11 +1512,11 @@ def compute_gold(kl):
     sn={'SWEEP_OB':'⚡ Gold Sweep+OB','ICT_KZ':'🕯️ Gold ICT Kill Zone','CHOCH':'🔄 Gold CHoCH','EMA_PULL':'📊 Gold EMA Pull'}
     why_map={
         'SWEEP_OB': (f"  1️⃣ Equal lows swept at ${wick_sl:.2f}\n"
-                     f"  2️⃣ Closed back above — stop hunt done\n"
-                     f"  3️⃣ OB zone: ${ob_hit['bot']:.2f} – ${ob_hit['top']:.2f}\n" if ob_hit else
-                     "  Sweep + OB retest\n")+
-                    f"  4️⃣ SL below wick = tight ${sl_dollar} risk\n"
-                    f"  💡 SCALP: TP1 at ${tp1:.2f} (+${tp1_dollar})",
+                     f"  2️⃣ Closed back above — stop hunt done\n" +
+                     (f"  3️⃣ OB zone: ${ob_hit['bot']:.2f} – ${ob_hit['top']:.2f}\n" if ob_hit else
+                     "  3️⃣ Sweep + OB retest\n") +
+                     f"  4️⃣ SL below wick = tight ${sl_dollar} risk\n"
+                     f"  💡 SCALP: TP1 at ${tp1:.2f} (+${tp1_dollar})"),
         'ICT_KZ':  (f"  1️⃣ Asia range consolidated\n"
                     f"  2️⃣ {sess} open broke range with volume\n"
                     f"  3️⃣ MACD + EMA confirm direction\n"
@@ -1708,8 +1708,8 @@ def compute_crypto_scalp(kl, pair):
     setup_names = {'SWEEP_OB':'⚡ Sweep+OB Retest','CHOCH':'🔄 CHoCH Reversal'}
     why_map = {
         'SWEEP_OB': (f"  1️⃣ Retail stops swept at {fp_crypto(wick_sl)}\n"
-                     f"  2️⃣ Closed back above — stop hunt done\n"
-                     (f"  3️⃣ OB zone: {fp_crypto(ob_hit['bot'])} – {fp_crypto(ob_hit['top'])}\n" if ob_hit else "")+
+                     f"  2️⃣ Closed back above — stop hunt done\n" +
+                     (f"  3️⃣ OB zone: {fp_crypto(ob_hit['bot'])} – {fp_crypto(ob_hit['top'])}\n" if ob_hit else "") +
                      f"  4️⃣ SL below wick — tight risk\n"
                      f"  💡 Scalp: target TP1 fast, trail to TP2"),
         'CHOCH':    (f"  1️⃣ {'Downtrend' if is_buy else 'Uptrend'} → structure shifted\n"
