@@ -1787,17 +1787,17 @@ from your own Telegram chat.
 import base64, zlib
 
 # All data files that must survive redeploys
-DATA_FILES = {
-    'smc_learning':    LEARN_FILE,
-    'smc_deep':        DEEP_LEARN_FILE,
-    'smc_journal':     JOURNAL_FILE,
-}
-
-# Add scalp file if this is the gold server
-try:
-    DATA_FILES['gold_scalp'] = SCALP_LEARN_FILE
-except NameError:
-    pass
+def get_data_files():
+    """Build data files dict at runtime — all vars guaranteed defined by then"""
+    files = {
+        'smc_learning': os.environ.get('LEARN_FILE',      '/data/smc_learning.json'),
+        'smc_deep':     os.environ.get('DEEP_LEARN_FILE', '/data/smc_deep_learning.json'),
+        'smc_journal':  os.environ.get('JOURNAL_FILE',    '/data/smc_journal.json'),
+    }
+    scalp = os.environ.get('SCALP_LEARN_FILE', '/data/gold_scalp_ml.json')
+    if scalp:
+        files['gold_scalp'] = scalp
+    return files
 
 def _tg_send_file(filepath, caption):
     """Send a JSON file to Telegram as document"""
@@ -1861,7 +1861,7 @@ def backup_data_to_tg(silent=False):
     Called every 6 hours and on graceful shutdown.
     """
     backed_up = []
-    for name, filepath in DATA_FILES.items():
+    for name, filepath in get_data_files().items():
         if not Path(filepath).exists(): continue
         try:
             size = Path(filepath).stat().st_size
@@ -1896,7 +1896,7 @@ def restore_data_from_tg():
     """
     restored = []; missing = []
 
-    for name, filepath in DATA_FILES.items():
+    for name, filepath in get_data_files().items():
         if Path(filepath).exists():
             size = Path(filepath).stat().st_size
             if size > 10:
