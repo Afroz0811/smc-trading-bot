@@ -1,4 +1,1 @@
-fastapi
-uvicorn
-websockets
-requests
+requests==2.31.0
